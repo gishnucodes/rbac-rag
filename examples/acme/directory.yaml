@@ -1,0 +1,50 @@
+users:
+  alice:
+    display_name: "Alice"
+    groups:
+      - engineering
+    roles: []
+
+  bob:
+    display_name: "Bob"
+    groups:
+      - hr
+    roles: []
+
+  carol:
+    display_name: "Carol (CFO)"
+    groups:
+      - finance
+      - executives
+    roles: []
+
+  dave:
+    display_name: "Dave"
+    groups:
+      - interns
+    roles: []
+
+  erin:
+    display_name: "Erin"
+    groups:
+      - contractors
+    roles: []
+
+  frank:
+    display_name: "Frank"
+    groups:
+      - finance
+    roles: []
+
+  grace:
+    display_name: "Grace"
+    groups:
+      - legal
+    roles:
+      - general_counsel
+
+  henry:
+    display_name: "Henry (CEO)"
+    groups:
+      - executives
+    roles: []
