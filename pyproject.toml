@@ -1,0 +1,39 @@
+[project]
+name = "rbac-rag"
+version = "0.1.0"
+description = "Pluggable RBAC-aware RAG on Postgres + pgvector with versioned ACL policies and RAGAS evals"
+readme = "README.md"
+authors = [
+    { name = "Gishnu Madhu", email = "gishnum.work@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "google-genai>=1.0",
+    "pgvector>=0.3",
+    "psycopg[binary]>=3.2",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "pyyaml>=6",
+    "typer>=0.12",
+]
+
+[project.optional-dependencies]
+evals = [
+    "ragas>=0.4",
+]
+
+[project.scripts]
+rbac-rag = "rbac_rag.cli:app"
+
+[build-system]
+requires = ["uv_build>=0.11.32,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["db: requires a reachable Postgres with pgvector (RBAC_RAG_TEST_DATABASE_URL)"]
