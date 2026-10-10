@@ -1,0 +1,70 @@
+version: 1
+name: "v1"
+description: "Initial access policy"
+
+classifications:
+  public: 0
+  internal: 1
+  confidential: 2
+  restricted: 3
+
+roles:
+  employee:
+    clearance: 1
+    inherits: []
+
+  engineer:
+    clearance: 1
+    inherits:
+      - employee
+
+  hr_manager:
+    clearance: 2
+    inherits:
+      - employee
+
+  finance_analyst:
+    clearance: 2
+    inherits:
+      - employee
+
+  executive:
+    clearance: 3
+    inherits:
+      - employee
+
+  auditor:
+    clearance: 2
+    inherits: []
+
+  contractor:
+    clearance: 1
+    inherits: []
+
+  intern:
+    clearance: 0
+    inherits: []
+
+  general_counsel:
+    clearance: 3
+    inherits: []
+
+groups:
+  engineering:
+    - engineer
+  hr:
+    - hr_manager
+  finance:
+    - finance_analyst
+  executives:
+    - executive
+  interns:
+    - intern
+  contractors:
+    - contractor
+  legal:
+    - general_counsel
+
+deny_rules:
+  - principal: "group:contractors"
+    classification: "confidential"

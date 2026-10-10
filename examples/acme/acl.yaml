@@ -1,0 +1,57 @@
+documents:
+  - id: handbook
+    path: docs/handbook.md
+    title: "Employee Handbook"
+    classification: public
+    allow:
+      - role:employee
+      - role:intern
+      - role:contractor
+    deny: []
+
+  - id: eng_runbook
+    path: docs/eng_runbook.md
+    title: "Engineering Operations & Infrastructure Runbook"
+    classification: internal
+    allow:
+      - role:engineer
+      - role:contractor
+      - role:intern
+    deny: []
+
+  - id: hr_comp_bands
+    path: docs/hr_comp_bands.md
+    title: "HR Compensation Bands & Compensation Structure"
+    classification: confidential
+    allow:
+      - role:hr_manager
+      - role:executive
+    deny: []
+
+  - id: finance_q3
+    path: docs/finance_q3.md
+    title: "Finance Q3 Financial Performance & Forecast Report"
+    classification: confidential
+    allow:
+      - role:finance_analyst
+      - role:executive
+    deny: []
+
+  - id: legal_project_nightjar
+    path: docs/legal_project_nightjar.md
+    title: "Legal Memorandum: Project Nightjar Acquisition Strategy"
+    classification: restricted
+    allow:
+      - role:executive
+      - user:grace
+    deny:
+      - user:carol
+
+  - id: audit_findings
+    path: docs/audit_findings.md
+    title: "Internal Audit Findings & Remediation Roadmap"
+    classification: confidential
+    allow:
+      - role:auditor
+      - role:executive
+    deny: []
