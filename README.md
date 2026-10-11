@@ -33,6 +33,8 @@ Install `rbac-rag` with evaluation extras using `uv`:
 uv sync --extra evals
 ```
 
+> **Note:** The `evals` extra pins `langchain-community<0.4.0` because `ragas 0.4.3` relies on `langchain_community.chat_models.vertexai`, which was removed in `langchain-community 0.4.0+`.
+
 ### 3. Seed database
 
 Seed migrations, directory, policies (v1 and v2), and sample documents into Postgres:
@@ -63,9 +65,11 @@ uv run python examples/acme/demo.py
 # Deterministic security evaluation (offline, zero LLM calls)
 uv run python evals/security_eval.py --fake
 
-# Quality evaluation using RAGAS + Gemini on Vertex AI
+# Quality evaluation using RAGAS + Gemini on Vertex AI (requires Google/Vertex credentials)
 uv run python evals/ragas_eval.py --policy 1
 ```
+
+If Google/Vertex credentials (`GOOGLE_API_KEY`, `GOOGLE_CLOUD_PROJECT`, or ADC) are missing, `ragas_eval.py` prints `skipped: no Vertex credentials` and exits gracefully with status code `0`.
 
 ---
 
@@ -99,37 +103,33 @@ When a user asks a question, `PgVectorStore.secure_search` combines vector simil
 
 ```sql
 WITH p AS (
-    -- Effective principals (user, groups, effective roles via inheritance & group-mapping)
-    SELECT * FROM rbac_effective_principals(%(uid)s, %(pv)s)
+    -- Effective principals resolved for caller (e.g. SELECT principal_type, principal_name FROM rbac_effective_principals(%(acl_user)s, %(acl_pv)s))
+    SELECT principal_type, principal_name FROM rbac_effective_principals(%(acl_user)s, %(acl_pv)s)
 ),
 clr AS (
     -- User's maximum clearance level across effective roles
-    SELECT rbac_user_clearance(%(uid)s, %(pv)s) AS lvl
+    SELECT rbac_clearance(ARRAY(SELECT principal_name FROM p WHERE principal_type='role'), %(pv)s) AS lvl
 )
-SELECT c.id, c.document_id, c.ordinal, c.content, c.classification,
-       d.title, d.source_uri,
-       1 - (c.embedding <=> %(q_emb)s) AS score
-FROM chunks c
-JOIN documents d ON d.id = c.document_id
-JOIN classification_levels cl ON cl.policy_version_id = %(pv)s AND cl.label = c.classification
-WHERE EXISTS (
-    SELECT 1 FROM chunk_acl a
-    JOIN p ON p.principal_type = a.principal_type AND p.principal_name = a.principal_name
-    WHERE a.chunk_id = c.id AND a.effect = 'allow'
-)
-AND NOT EXISTS (
-    SELECT 1 FROM chunk_acl a
-    JOIN p ON p.principal_type = a.principal_type AND p.principal_name = a.principal_name
-    WHERE a.chunk_id = c.id AND a.effect = 'deny'
-)
-AND NOT EXISTS (
-    SELECT 1 FROM policy_deny_rules r
-    JOIN p ON p.principal_type = r.principal_type AND p.principal_name = r.principal_name
-    WHERE r.policy_version_id = %(pv)s AND r.classification = c.classification
-)
-AND cl.required_clearance <= (SELECT lvl FROM clr)
-ORDER BY c.embedding <=> %(q_emb)s
-LIMIT %(k)s;
+SELECT c.id, c.document_id, d.title, c.content, c.classification, c.metadata,
+       1 - (c.embedding <=> %(q)s::vector) AS score,
+       (SELECT json_agg(json_build_array(a.principal_type, a.principal_name, a.effect))
+        FROM chunk_acl a WHERE a.chunk_id = c.id) AS acl
+FROM chunks c JOIN documents d ON d.id = c.document_id
+JOIN classification_levels cl ON cl.policy_version = %(pv)s AND cl.label = c.classification
+WHERE cl.required_clearance <= (SELECT lvl FROM clr)
+  AND EXISTS (
+      SELECT 1 FROM chunk_acl a JOIN p USING (principal_type, principal_name)
+      WHERE a.chunk_id = c.id AND a.effect = 'allow'
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM chunk_acl a JOIN p USING (principal_type, principal_name)
+      WHERE a.chunk_id = c.id AND a.effect = 'deny'
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM policy_deny_rules r JOIN p USING (principal_type, principal_name)
+      WHERE r.policy_version = %(pv)s AND r.classification = c.classification
+  )
+ORDER BY c.embedding <=> %(q)s::vector, c.id LIMIT %(k)s;
 ```
 
 ---
@@ -145,38 +145,44 @@ Access evaluation follows strict deny-by-default logic across 6 rule types:
 | **Clearance Requirement** | The user's maximum clearance level across effective roles must be $\ge$ the required clearance level defined for the chunk's classification in the active policy. |
 | **Policy Deny Rules** | Global policy rules can deny specific principals (`user`, `group`, or `role`) access to an entire classification level (e.g. `contractor` restricted from `internal`). |
 | **Unknown Classification** | If a chunk's classification label is not defined in the active policy version, access is denied. |
-| **Unknown User** | If a user cannot be resolved in the directory (or has no claims), access is denied for all non-public content. |
+| **Unknown User** | If a user is unknown (not found in directory or has no claims), `Policy.decide` evaluates the subject as `None` and denies access to **everything**. |
 
 ---
 
 ## Extending Components
 
-`rbac-rag` provides Protocol interfaces in `rbac_rag.interfaces`. Custom components can be registered by built-in shorthand name or loaded via `pkg.module:Class` specs.
+`rbac-rag` provides Protocol interfaces in `rbac_rag.interfaces`. Component factories try initializing with `cls(settings)` first, falling back to `cls()`.
 
 ### Custom `AclFilter` (e.g. Tenant Scoping)
 
 ```python
 from typing import Any
-from rbac_rag.types import UserContext
+from rbac_rag.acl.filters import DirectoryAclFilter
 from rbac_rag.interfaces import SqlFragment, AclFilter
+from rbac_rag.types import UserContext
 
 class TenantAclFilter(AclFilter):
     name = "tenant"
 
+    def __init__(self, tenant_id: str = "acme"):
+        self.tenant_id = tenant_id
+
     def build(self, user: UserContext, policy_version: int) -> SqlFragment:
-        # Use Directory CTE for principal resolution + add tenant extra_where filter
-        principals_sql = "SELECT principal_type, principal_name FROM rbac_effective_principals(%(uid)s, %(pv)s)"
-        tenant_id = user.attributes.get("tenant_id", "default")
-        extra_where = "d.metadata->>'tenant_id' = %(tenant_id)s"
         return SqlFragment(
-            principals_sql=principals_sql,
-            params={"tenant_id": tenant_id},
-            extra_where=extra_where,
+            principals_sql=(
+                "SELECT principal_type, principal_name "
+                "FROM rbac_effective_principals(%(acl_user)s, %(acl_pv)s)"
+            ),
+            params={
+                "acl_user": user.user_id,
+                "acl_pv": policy_version,
+                "tenant_id": self.tenant_id,
+            },
+            extra_where="d.metadata->>'tenant_id' = %(tenant_id)s",
         )
 
     def memberships(self, conn: Any, user: UserContext) -> tuple[set[str], set[str]] | None:
-        # Return (groups, roles) directly held by the user
-        ...
+        return DirectoryAclFilter().memberships(conn, user)
 ```
 
 To configure custom classes in settings or environment variables:
@@ -196,9 +202,11 @@ Policies define roles, inheritance, group-to-role mappings, clearance levels, an
 
 1. **Publish a Policy Version:**
 
+Note: Running `seed.py` publishes both `policy_v1.yaml` and `policy_v2.yaml` into the database. Re-publishing `policy_v2.yaml` confirms version matching:
+
 ```bash
 uv run rbac-rag policy publish examples/acme/policy_v2.yaml
-# Published policy v2 ('Acme Policy v2')
+# Policy v2 already exists with identical content
 ```
 
 2. **Diff Policy Versions:**
@@ -214,7 +222,10 @@ uv run rbac-rag policy diff 1 2
 Run security and quality evals against policy v2 without affecting production users:
 
 ```bash
-uv run python evals/security_eval.py --policies 1,2
+# Offline evaluation using --fake
+uv run python evals/security_eval.py --fake --policies 1,2
+
+# Live evaluation (requires Vertex credentials and documents embedded with live embedder)
 uv run python evals/ragas_eval.py --policy 2
 ```
 
@@ -235,9 +246,9 @@ uv run rbac-rag policy activate 2
 
 ### 1. Deterministic Security Eval (`evals/security_eval.py`)
 
-Runs offline without external LLM dependencies.
+Runs offline without external LLM dependencies (`--fake`).
 - **Leakage Rate:** Must be `0.0`. Asserts retrieved chunks $\subseteq$ oracle-authorized chunks for every persona query.
-- **Canary Exposures:** Verifies restricted canary strings (e.g. `NIGHTJAR-7731`, `COMPBAND-9921`) never appear in contexts retrieved for unauthorized personas.
+- **Canary Exposures & In-Answer Checks:** Verifies restricted canary strings (e.g. `NIGHTJAR-7731`, `COMPBAND-9921`) never appear in contexts or generated answers retrieved for unauthorized personas.
 - **Access Recall:** Fraction of expected authorized documents retrieved for target persona questions.
 - **Policy Delta:** Reports documents gained and lost per persona across policy versions.
 
@@ -248,14 +259,15 @@ Evaluates pipeline responses using Gemini on Vertex AI.
 - **Answer Relevancy:** Measures question-answer alignment.
 - **Context Precision & Recall:** Evaluates context retrieval quality against ground truth references.
 - **Refusal Accuracy:** Verifies the model correctly refuses unauthorized queries (`should_refuse: true`).
-- **Leakage Critic:** Aspect critic evaluating whether sensitive facts were exposed in generated answers.
+- **Leakage Critic:** Uses a DiscreteMetric judge (`allowed_values=["safe", "leak"]`) to detect whether sensitive facts were exposed in generated answers.
+- **Credential Handling:** If Google/Vertex AI credentials are not found, `ragas_eval.py` prints `skipped: no Vertex credentials` and exits with `0`.
 
 ---
 
 ## Known Limits
 
-- **Filtered HNSW Recall on pgvector:**
-  For `pgvector < 0.8`, pre-filtered HNSW searches may exhibit degraded recall (< 0.8) when ACL filters significantly restrict candidate vector sets. On `pgvector >= 0.8`, `rbac-rag` automatically executes retrieval with `SET LOCAL hnsw.iterative_scan = relaxed_order` to maintain high recall during filtered search.
+- **Post-Filtered HNSW Recall on pgvector:**
+  For `pgvector < 0.8`, post-filtered HNSW searches may exhibit degraded recall (< 0.8) when ACL filters significantly restrict candidate vector sets. On `pgvector >= 0.8`, `rbac-rag` automatically executes retrieval with `SET LOCAL hnsw.iterative_scan = relaxed_order` to maintain high recall during filtered search.
 - **Claims Filter Trust:**
   The `ClaimsAclFilter` trusts group and role claims provided directly in the `UserContext` without querying the central user directory table. Downstream authentication infrastructure must validate and sign claims prior to invocation.
 - **Author-Controlled Classification Overrides:**

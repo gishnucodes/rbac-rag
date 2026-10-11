@@ -28,7 +28,7 @@ src/rbac_rag/
   db/
     connection.py      # Database connection factory
     migrate.py         # Schema migration engine
-    migrations/        # 0001_core.sql, 0002_policy.sql, 0003_acl_functions.sql
+    migrations/        # 0001_core.sql, 0002_policy.sql, 0003_acl_functions.sql, 0004_audit.sql
   chunking/            # MarkdownChunker (with section ACLs), RecursiveChunker
   embeddings/          # GeminiEmbedder, HashingEmbedder (fake)
   llm/                 # GeminiLLM, ExtractiveLLM (fake)
@@ -53,61 +53,59 @@ tests/                 # Pytest test suite
 ## Data Model & Migrations
 - `schema_migrations(version, name, applied_at)` tracks applied database migrations.
 - **Policy Tables:**
-  - `policy_versions(id, version, name, description, checksum, created_at, is_active)`
-  - `roles(policy_version_id, name, clearance, description)`
-  - `role_inheritance(policy_version_id, role_name, parent_role_name)`
-  - `group_roles(policy_version_id, group_name, role_name)`
-  - `classification_levels(policy_version_id, label, required_clearance)`
-  - `policy_deny_rules(policy_version_id, principal_type, principal_name, classification)`
+  - `policy_versions(version, name, description, checksum, is_active, created_at, activated_at)`
+  - `roles(policy_version, name, clearance, description)`
+  - `role_inheritance(policy_version, role, parent_role)`
+  - `group_roles(policy_version, group_name, role)`
+  - `classification_levels(policy_version, label, required_clearance)`
+  - `policy_deny_rules(policy_version, principal_type, principal_name, classification)`
 - **Directory Tables:**
-  - `users(id, username, attributes)`
+  - `users(id, display_name, attributes)`
   - `user_groups(user_id, group_name)`
   - `user_roles(user_id, role_name)`
 - **Document & Chunk Tables:**
-  - `documents(id, source_uri, title, classification, content_hash, metadata)`
+  - `documents(id, title, source_uri, classification, content_hash, acl_hash, metadata)`
   - `chunks(id, document_id, ordinal, content, classification, embedding vector(768), metadata)` with an HNSW cosine index (`vector_cosine_ops`).
-  - `chunk_acl(chunk_id, principal_type, principal_name, effect)` with indices on `chunk_id` and `(principal_type, principal_name)`.
+  - `chunk_acl(chunk_id, principal_type, principal_name, effect)` with primary key `(chunk_id, principal_type, principal_name, effect)` and index on `(principal_type, principal_name, effect, chunk_id)`.
+- **Audit Table:**
+  - `retrieval_audit(id, at, user_id, policy_version, acl_filter, query, chunk_ids)`
 
 ## Single-Query Vector Retrieval SQL
 During retrieval, `PgVectorStore.secure_search()` combines vector distance with ACL CTE filtering:
 ```sql
 WITH p AS (
-    -- Effective principals resolved for the user under active or requested policy version
-    SELECT * FROM rbac_effective_principals(%(uid)s, %(pv)s)
+    -- Effective principals resolved for caller (e.g. via rbac_effective_principals(%(acl_user)s, %(acl_pv)s))
+    SELECT principal_type, principal_name FROM rbac_effective_principals(%(acl_user)s, %(acl_pv)s)
 ),
 clr AS (
     -- Maximum clearance level across effective roles
-    SELECT rbac_user_clearance(%(uid)s, %(pv)s) AS lvl
+    SELECT rbac_clearance(ARRAY(SELECT principal_name FROM p WHERE principal_type='role'), %(pv)s) AS lvl
 )
-SELECT c.id, c.document_id, c.ordinal, c.content, c.classification,
-       d.title, d.source_uri,
-       1 - (c.embedding <=> %(q_emb)s) AS score
-FROM chunks c
-JOIN documents d ON d.id = c.document_id
-JOIN classification_levels cl ON cl.policy_version_id = %(pv)s AND cl.label = c.classification
-WHERE EXISTS (
-    SELECT 1 FROM chunk_acl a
-    JOIN p ON p.principal_type = a.principal_type AND p.principal_name = a.principal_name
-    WHERE a.chunk_id = c.id AND a.effect = 'allow'
-)
-AND NOT EXISTS (
-    SELECT 1 FROM chunk_acl a
-    JOIN p ON p.principal_type = a.principal_type AND p.principal_name = a.principal_name
-    WHERE a.chunk_id = c.id AND a.effect = 'deny'
-)
-AND NOT EXISTS (
-    SELECT 1 FROM policy_deny_rules r
-    JOIN p ON p.principal_type = r.principal_type AND p.principal_name = r.principal_name
-    WHERE r.policy_version_id = %(pv)s AND r.classification = c.classification
-)
-AND cl.required_clearance <= (SELECT lvl FROM clr)
-ORDER BY c.embedding <=> %(q_emb)s
-LIMIT %(k)s;
+SELECT c.id, c.document_id, d.title, c.content, c.classification, c.metadata,
+       1 - (c.embedding <=> %(q)s::vector) AS score,
+       (SELECT json_agg(json_build_array(a.principal_type, a.principal_name, a.effect))
+        FROM chunk_acl a WHERE a.chunk_id = c.id) AS acl
+FROM chunks c JOIN documents d ON d.id = c.document_id
+JOIN classification_levels cl ON cl.policy_version = %(pv)s AND cl.label = c.classification
+WHERE cl.required_clearance <= (SELECT lvl FROM clr)
+  AND EXISTS (
+      SELECT 1 FROM chunk_acl a JOIN p USING (principal_type, principal_name)
+      WHERE a.chunk_id = c.id AND a.effect = 'allow'
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM chunk_acl a JOIN p USING (principal_type, principal_name)
+      WHERE a.chunk_id = c.id AND a.effect = 'deny'
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM policy_deny_rules r JOIN p USING (principal_type, principal_name)
+      WHERE r.policy_version = %(pv)s AND r.classification = c.classification
+  )
+ORDER BY c.embedding <=> %(q)s::vector, c.id LIMIT %(k)s;
 ```
 
 ## Security & Quality Evals
 1. **Deterministic Security Evaluation (`evals/security_eval.py`):**
-   - Runs offline using the fake embedder/LLM.
+   - Runs offline using the fake embedder/LLM (`--fake`).
    - Verifies zero leakage (`retrieved_chunks ⊆ authorized_chunks`) across all persona queries.
    - Scans retrieved context for forbidden canary strings (e.g. `NIGHTJAR-7731`).
    - Computes Access Recall against target persona expectation sets.
@@ -116,4 +114,5 @@ LIMIT %(k)s;
    - Evaluates answer quality using Gemini 2.5 Flash as judge via Vertex AI / Google GenAI.
    - Metrics: Faithfulness, Answer Relevancy, Context Precision, Context Recall.
    - Refusal Accuracy for non-authorized queries (`should_refuse: true`).
-   - Leakage Critic judge detecting sensitive fact exposures in generated answers.
+   - DiscreteMetric `leakage_critic` judge (`safe`/`leak`) detecting sensitive fact exposures in generated answers.
+   - Skips gracefully (`skipped: no Vertex credentials`, exit code 0) if Google/Vertex AI credentials are missing.
