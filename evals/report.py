@@ -1,4 +1,4 @@
-"""Report writer for security evaluation results."""
+"""Report writer for security and RAGAS evaluation results."""
 
 from __future__ import annotations
 
@@ -8,17 +8,25 @@ from pathlib import Path
 from typing import Any
 
 
-def save_report(results: dict[str, Any], output_dir: str | Path = "evals/results") -> tuple[Path, Path]:
+def save_report(
+    results: dict[str, Any],
+    output_dir: str | Path = "evals/results",
+    filename_prefix: str = "security",
+) -> tuple[Path, Path]:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
     timestamp = results.get("timestamp") or datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    json_path = output_path / f"{timestamp}_security.json"
-    md_path = output_path / f"{timestamp}_security.md"
+    json_path = output_path / f"{timestamp}_{filename_prefix}.json"
+    md_path = output_path / f"{timestamp}_{filename_prefix}.md"
 
     json_path.write_text(json.dumps(results, indent=2))
 
-    md_content = generate_markdown_report(results)
+    if filename_prefix == "security":
+        md_content = generate_markdown_report(results)
+    else:
+        md_content = generate_ragas_markdown_report(results)
+
     md_path.write_text(md_content)
 
     print(f"\nReport saved:\n  JSON: {json_path}\n  Markdown: {md_path}\n")
@@ -101,4 +109,68 @@ def generate_markdown_report(results: dict[str, Any]) -> str:
             )
         lines.append("")
 
+    return "\n".join(lines)
+
+
+def generate_ragas_markdown_report(results: dict[str, Any]) -> str:
+    summary = results.get("summary", {})
+    samples = results.get("results", [])
+    policy_version = results.get("policy_version", 1)
+    timestamp = results.get("timestamp", "")
+
+    lines = [
+        f"# RAGAS Evaluation Report (Policy v{policy_version})",
+        f"**Timestamp:** {timestamp}",
+        "",
+        "## Summary Metrics",
+        "",
+    ]
+
+    overall = summary.get("overall_metrics", {})
+    if overall:
+        lines.extend([
+            "| Metric | Score |",
+            "| --- | --- |",
+        ])
+        for k, v in overall.items():
+            val_str = f"{v:.4f}" if isinstance(v, (int, float)) else str(v)
+            lines.append(f"| {k} | {val_str} |")
+        lines.append("")
+
+    persona_mets = summary.get("persona_metrics", {})
+    if persona_mets:
+        lines.extend([
+            "## Per-Persona Breakdown",
+            "",
+        ])
+        metric_keys = sorted({m for p in persona_mets.values() for m in p.keys()})
+        headers = ["Persona"] + metric_keys
+        lines.append("| " + " | ".join(headers) + " |")
+        lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+        for p in sorted(persona_mets.keys()):
+            p_data = persona_mets[p]
+            row = [p]
+            for mk in metric_keys:
+                v = p_data.get(mk, "N/A")
+                val_str = f"{v:.4f}" if isinstance(v, (int, float)) else str(v)
+                row.append(val_str)
+            lines.append("| " + " | ".join(row) + " |")
+        lines.append("")
+
+    lines.extend([
+        "## Sample Results",
+        "",
+        "| ID | Persona | Question | Refused | Canary Safe | Leakage Critic |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ])
+    for r in samples:
+        sample_id = r.get("id", "N/A")
+        persona = r.get("persona", "N/A")
+        q = str(r.get("question", "")).replace("|", "\\|")
+        refused = "Yes" if r.get("refused") else "No"
+        canary_safe = "Pass" if r.get("canary_safe", True) else "FAIL"
+        leak_critic = str(r.get("leakage_critic", "N/A"))
+        lines.append(f"| {sample_id} | {persona} | {q} | {refused} | {canary_safe} | {leak_critic} |")
+
+    lines.append("")
     return "\n".join(lines)
