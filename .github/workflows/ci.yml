@@ -46,3 +46,8 @@ jobs:
         env:
           RBAC_RAG_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
         run: uv run pytest
+
+      - name: Run deterministic security eval
+        env:
+          RBAC_RAG_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+        run: uv run python evals/security_eval.py --fake
