@@ -20,7 +20,6 @@ dependencies = [
 [project.optional-dependencies]
 evals = [
     "ragas>=0.4",
-    "langchain-community<0.4.0",
 ]
 
 [project.scripts]
@@ -36,6 +35,5 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-pythonpath = ["."]
 testpaths = ["tests"]
 markers = ["db: requires a reachable Postgres with pgvector (RBAC_RAG_TEST_DATABASE_URL)"]

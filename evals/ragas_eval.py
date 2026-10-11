@@ -10,7 +10,9 @@ import argparse
 import asyncio
 import logging
 import os
+import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +41,8 @@ from rbac_rag.types import UserContext
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
+
+CANARY_PATTERN = re.compile(r"[A-Z0-9]+-\d{4}")
 
 
 def check_google_credentials(settings: Settings) -> bool:
@@ -82,9 +86,20 @@ class GeminiRagasEmbeddingAdapter(BaseRagasEmbedding):
         return await loop.run_in_executor(None, self.embed_text, text, **kwargs)
 
 
-def load_dataset(path: str | Path = "evals/dataset.yaml") -> list[dict[str, Any]]:
+def load_dataset(policy_version: int, path: str | Path = "evals/dataset.yaml") -> list[dict[str, Any]]:
     with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        raw_rows = yaml.safe_load(f)
+
+    resolved_rows = []
+    for row in raw_rows:
+        item = dict(row)
+        by_policy = item.pop("by_policy", {}) or {}
+        # Apply policy-specific override if present
+        if policy_version in by_policy or str(policy_version) in by_policy:
+            override = by_policy.get(policy_version) or by_policy.get(str(policy_version)) or {}
+            item.update(override)
+        resolved_rows.append(item)
+    return resolved_rows
 
 
 async def evaluate_with_retry(
@@ -121,8 +136,11 @@ async def evaluate_sample(
         question = sample["question"]
         should_refuse = sample.get("should_refuse", False)
         reference = sample.get("reference", "")
-        forbidden_canaries = sample.get("forbidden_canaries", [])
-        sensitive_facts = sample.get("sensitive_facts", "")
+        sensitive_facts = sample.get("sensitive_facts", [])
+        if isinstance(sensitive_facts, list):
+            sensitive_facts_str = "; ".join(sensitive_facts)
+        else:
+            sensitive_facts_str = str(sensitive_facts)
 
         user = UserContext(user_id=persona, policy_version=policy_version)
 
@@ -138,12 +156,11 @@ async def evaluate_sample(
             not should_refuse or response_text == REFUSAL
         )
 
-        # 3. Canary Check
+        # 3. Canary Check (Deterministic canary check in answer)
+        canaries_in_response = CANARY_PATTERN.findall(response_text)
         canary_safe = True
-        for canary in forbidden_canaries:
-            if canary in response_text:
-                canary_safe = False
-                break
+        if should_refuse and canaries_in_response:
+            canary_safe = False
 
         # 4. Leakage Judge
         leakage_metric = DiscreteMetric(
@@ -162,7 +179,7 @@ async def evaluate_sample(
                 leakage_metric.ascore,
                 llm=llm,
                 response=response_text,
-                sensitive_facts=sensitive_facts,
+                sensitive_facts=sensitive_facts_str,
             )
             leakage_critic = leak_res.value
         except Exception as exc:
@@ -260,7 +277,7 @@ async def run_eval(
     embedder = GeminiEmbedder(settings, client=client)
     ragas_embeddings = GeminiRagasEmbeddingAdapter(embedder)
 
-    dataset = load_dataset()
+    dataset = load_dataset(policy_version=policy_version)
     if personas_filter:
         dataset = [d for d in dataset if d["persona"] in personas_filter]
     if limit:
@@ -328,12 +345,22 @@ async def run_eval(
 
         persona_metrics[p] = p_summary
 
-    summary = {
-        "overall_metrics": overall_metrics,
-        "persona_metrics": persona_metrics,
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    report_payload = {
+        "timestamp": timestamp,
+        "policy_version": policy_version,
+        "summary": {
+            "overall_metrics": overall_metrics,
+            "persona_metrics": persona_metrics,
+        },
+        "results": results,
     }
 
-    json_path, md_path = save_report("ragas", policy_version, results, summary)
+    json_path, md_path = save_report(
+        report_payload,
+        output_dir="evals/results",
+        filename_prefix=f"ragas_v{policy_version}",
+    )
     log.info("Saved evaluation report to:\n  JSON: %s\n  Markdown: %s", json_path, md_path)
 
 
