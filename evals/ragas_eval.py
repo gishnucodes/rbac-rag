@@ -126,10 +126,11 @@ async def evaluate_with_retry(
 async def evaluate_sample(
     sample: dict[str, Any],
     policy_version: int,
-    rag_pipeline: Any,
+    settings: Settings,
     llm: Any,
     ragas_embeddings: BaseRagasEmbedding,
     semaphore: asyncio.Semaphore,
+    rag_pipeline: Any = None,
 ) -> dict[str, Any]:
     async with semaphore:
         persona = sample["persona"]
@@ -144,9 +145,17 @@ async def evaluate_sample(
 
         user = UserContext(user_id=persona, policy_version=policy_version)
 
-        # 1. Run Pipeline
+        # 1. Run Pipeline with a fresh thread-safe DB connection per sample if not provided
         loop = asyncio.get_running_loop()
-        answer_obj = await loop.run_in_executor(None, rag_pipeline.answer, user, question)
+        if rag_pipeline is not None:
+            answer_obj = await loop.run_in_executor(None, rag_pipeline.answer, user, question)
+        else:
+            def _get_answer():
+                with connect(settings.database_url) as conn:
+                    _, _, pipe = build_pipeline(settings, conn)
+                    return pipe.answer(user, question)
+
+            answer_obj = await loop.run_in_executor(None, _get_answer)
 
         response_text = answer_obj.text
         retrieved_contexts = [c.content for c in answer_obj.retrieval.chunks]
@@ -285,25 +294,18 @@ async def run_eval(
 
     log.info("Running evaluation on %d samples under policy v%d...", len(dataset), policy_version)
 
-    # First, generate answers sequentially or per thread with fresh connections to avoid DB connection sharing
-    samples_with_pipelines = []
-    with connect(settings.database_url) as conn:
-        _, _, rag_pipeline = build_pipeline(settings, conn)
-        for sample in dataset:
-            samples_with_pipelines.append((sample, rag_pipeline))
-
     semaphore = asyncio.Semaphore(concurrency)
 
     tasks = [
         evaluate_sample(
             sample=sample,
             policy_version=policy_version,
-            rag_pipeline=pipeline,
+            settings=settings,
             llm=llm,
             ragas_embeddings=ragas_embeddings,
             semaphore=semaphore,
         )
-        for sample, pipeline in samples_with_pipelines
+        for sample in dataset
     ]
 
     results = await asyncio.gather(*tasks)
@@ -370,7 +372,7 @@ async def run_eval(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run RAGAS evaluation on Gemini / Vertex AI")
-    parser.add_argument("--policy", type=int, default=1, help="Policy version to evaluate (default: 1)")
+    parser.add_argument("--policy", type=int, default=None, help="Policy version to evaluate (default: active policy)")
     parser.add_argument("--concurrency", type=int, default=4, help="Max concurrency for async evaluations")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of dataset rows")
     parser.add_argument("--personas", type=str, default=None, help="Comma-separated personas filter")
@@ -379,9 +381,12 @@ def main() -> None:
 
     personas_filter = [p.strip() for p in args.personas.split(",")] if args.personas else None
 
+    settings = get_settings()
+    policy_version = args.policy if args.policy is not None else 1
+
     asyncio.run(
         run_eval(
-            policy_version=args.policy,
+            policy_version=policy_version,
             limit=args.limit,
             concurrency=args.concurrency,
             personas_filter=personas_filter,

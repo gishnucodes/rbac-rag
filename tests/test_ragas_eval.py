@@ -7,6 +7,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from evals.ragas_eval import (
     GeminiRagasEmbeddingAdapter,
     check_google_credentials,
@@ -113,10 +118,11 @@ def test_evaluate_sample_wiring_answerable():
             evaluate_sample(
                 sample=sample,
                 policy_version=1,
-                rag_pipeline=mock_rag_pipeline,
+                settings=Settings(),
                 llm=mock_llm,
                 ragas_embeddings=mock_adapter,
                 semaphore=semaphore,
+                rag_pipeline=mock_rag_pipeline,
             )
         )
 
@@ -173,10 +179,11 @@ def test_evaluate_sample_wiring_refusal():
             evaluate_sample(
                 sample=sample,
                 policy_version=1,
-                rag_pipeline=mock_rag_pipeline,
+                settings=Settings(),
                 llm=mock_llm,
                 ragas_embeddings=mock_adapter,
                 semaphore=semaphore,
+                rag_pipeline=mock_rag_pipeline,
             )
         )
 
