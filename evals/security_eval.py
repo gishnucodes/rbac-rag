@@ -34,7 +34,91 @@ from rbac_rag.pipeline.retriever import SecureRetriever
 from rbac_rag.store.pgvector_store import PgVectorStore
 from rbac_rag.types import UserContext
 
-CANARY_PATTERN = re.compile(r"\b[A-Z]+-\d{4}\b")
+CANARY_PATTERN = re.compile(r"\b[A-Z0-9]+-\d{4}\b")
+
+EXPECTED_CANARIES = {
+    "AUDIT-3360",
+    "BREAKGLASS-4417",
+    "COMPBAND-9921",
+    "FINQ3-5582",
+    "NIGHTJAR-7731",
+    "RESERVE-2290",
+}
+
+
+def build_canary_map(chunks: list[Any]) -> dict[str, list[Any]]:
+    """Build a mapping from canary string -> list of source chunks containing it."""
+    canary_map: dict[str, list[Any]] = {}
+    for chunk in chunks:
+        content = getattr(chunk, "content", "")
+        for canary in CANARY_PATTERN.findall(content):
+            canary_map.setdefault(canary, []).append(chunk)
+    return canary_map
+
+
+def verify_canaries_exist_and_unique(canary_map: dict[str, list[Any]]) -> None:
+    found_canaries = set(canary_map.keys())
+    missing = EXPECTED_CANARIES - found_canaries
+    if missing:
+        raise RuntimeError(f"Corpus scan failed: missing expected canaries: {sorted(missing)}")
+
+    for canary in EXPECTED_CANARIES:
+        count = len(canary_map.get(canary, []))
+        if count != 1:
+            raise RuntimeError(f"Corpus scan failed: canary {canary} found in {count} chunks, expected exactly 1")
+
+
+def get_unauthorized_canaries_for_subject(
+    canary_map: dict[str, list[Any]],
+    oracle_policy: Policy,
+    subject: Any,
+) -> set[str]:
+    unauthorized = set()
+    for canary, source_chunks in canary_map.items():
+        all_denied = True
+        for chunk in source_chunks:
+            classification = getattr(chunk, "classification")
+            acl = getattr(chunk, "acl")
+            decision = oracle_policy.decide(subject, classification, acl)
+            if decision.allowed:
+                all_denied = False
+                break
+        if all_denied:
+            unauthorized.add(canary)
+    return unauthorized
+
+
+def load_all_chunks_from_db(conn: Any) -> list[Any]:
+    from rbac_rag.types import Acl, Chunk, Principal, PrincipalType
+
+    acl_map: dict[str, tuple[set[Principal], set[Principal]]] = {}
+    for cid, ptype, pname, effect in conn.execute(
+        "SELECT chunk_id, principal_type, principal_name, effect FROM chunk_acl"
+    ).fetchall():
+        allows, denies = acl_map.setdefault(cid, (set(), set()))
+        p = Principal(PrincipalType(ptype), pname)
+        if effect == "allow":
+            allows.add(p)
+        elif effect == "deny":
+            denies.add(p)
+
+    chunks = []
+    for cid, doc_id, ordinal, content, classification in conn.execute(
+        "SELECT id, document_id, ordinal, content, classification FROM chunks"
+    ).fetchall():
+        allows, denies = acl_map.get(cid, (set(), set()))
+        acl = Acl(frozenset(allows), frozenset(denies))
+        chunks.append(
+            Chunk(
+                id=cid,
+                document_id=doc_id,
+                ordinal=ordinal,
+                content=content,
+                classification=classification,
+                acl=acl,
+            )
+        )
+    return chunks
 
 
 def parse_policies_arg(val: str) -> list[int]:
@@ -107,6 +191,10 @@ def run_security_eval(fake: bool = True, policies: list[int] | None = None) -> d
             k=settings.top_k,
         )
 
+        all_db_chunks = load_all_chunks_from_db(conn)
+        canary_map = build_canary_map(all_db_chunks)
+        verify_canaries_exist_and_unique(canary_map)
+
         for pv in policies:
             if pv not in policy_oracles:
                 oracle_policy = policy_store.get(pv)
@@ -164,12 +252,14 @@ def run_security_eval(fake: bool = True, policies: list[int] | None = None) -> d
                                 "reason": decision.reason,
                             })
 
-                    # 2. Canary Exposure Check (canaries from unauthorized chunks)
+                    # 2. Canary Exposure Check
+                    unauthorized_canaries = get_unauthorized_canaries_for_subject(
+                        canary_map, oracle_policy, subject
+                    )
                     for chunk in chunks:
-                        decision = oracle_policy.decide(subject, chunk.classification, chunk.acl)
-                        if not decision.allowed:
-                            canaries_in_chunk = CANARY_PATTERN.findall(chunk.content)
-                            for canary in canaries_in_chunk:
+                        canaries_in_retrieved_text = CANARY_PATTERN.findall(chunk.content)
+                        for canary in canaries_in_retrieved_text:
+                            if canary in unauthorized_canaries:
                                 pv_canary_exposures += 1
                                 total_canary_exposures += 1
                                 canary_details.append({
