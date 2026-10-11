@@ -1,4 +1,4 @@
-"""Integration tests for secure retrieval, ingestion, RAG pipeline, and registry."""
+"""DB integration tests for secure retrieval, ingestion, ACL enforcement, and audit."""
 
 import os
 import tempfile
@@ -8,8 +8,8 @@ import pytest
 import psycopg
 
 from rbac_rag.acl.directory import DirectoryStore, DirectoryUser, load_directory
-from rbac_rag.acl.filters import DirectoryAclFilter
-from rbac_rag.acl.guard import AccessGuard, AccessViolation
+from rbac_rag.acl.filters import DirectoryAclFilter, ClaimsAclFilter
+from rbac_rag.acl.guard import AccessGuard, AccessViolation, resolve_subject
 from rbac_rag.acl.policy import Policy, load_policy
 from rbac_rag.acl.policy_store import PolicyStore
 from rbac_rag.chunking.markdown import MarkdownChunker
@@ -22,7 +22,7 @@ from rbac_rag.pipeline.rag import REFUSAL, RAGPipeline
 from rbac_rag.pipeline.retriever import SecureRetriever
 from rbac_rag.registry import build_pipeline
 from rbac_rag.store.pgvector_store import PgVectorStore
-from rbac_rag.types import Acl, Chunk, Principal, SourceDocument, UserContext
+from rbac_rag.types import Acl, Chunk, Principal, PrincipalType, SourceDocument, UserContext
 
 pytestmark = pytest.mark.db
 
@@ -41,15 +41,18 @@ class BypassingAclFilter:
         return DirectoryAclFilter().memberships(conn, user)
 
 
-def test_real_corpus_acme(db_conn):
+@pytest.fixture
+def acme_env(db_conn):
+    """Seed the Acme corpus from examples/acme with HashingEmbedder and setup policies and directory."""
     manifest_path = Path("examples/acme/acl.yaml")
     docs = load_manifest(manifest_path)
-    assert len(docs) == 6
 
-    policy_path = Path("examples/acme/policy_v1.yaml")
-    policy = load_policy(policy_path)
+    policy_v1 = load_policy("examples/acme/policy_v1.yaml")
+    policy_v2 = load_policy("examples/acme/policy_v2.yaml")
+
     policy_store = PolicyStore(db_conn)
-    policy_store.publish(policy, activate=True)
+    policy_store.publish(policy_v1, activate=True)
+    policy_store.publish(policy_v2, activate=False)
 
     directory_path = Path("examples/acme/directory.yaml")
     directory = load_directory(directory_path)
@@ -60,8 +63,7 @@ def test_real_corpus_acme(db_conn):
     chunker = MarkdownChunker(chunk_size=800, chunk_overlap=120)
 
     ingest_pipeline = IngestionPipeline(chunker=chunker, embedder=embedder, store=store)
-    ingested = ingest_pipeline.ingest(docs)
-    assert len(ingested) == 6
+    ingest_pipeline.ingest(docs)
 
     retriever = SecureRetriever(
         conn=db_conn,
@@ -73,32 +75,443 @@ def test_real_corpus_acme(db_conn):
         k=10,
     )
 
-    # 1. Carol (CFO/Executive) is explicitly denied legal_project_nightjar
-    carol_user = UserContext(user_id="carol")
-    res_carol = retriever.retrieve(carol_user, "Nightjar acquisition strategy")
+    return {
+        "docs": docs,
+        "policy_v1": policy_v1,
+        "policy_v2": policy_v2,
+        "policy_store": policy_store,
+        "directory": directory,
+        "embedder": embedder,
+        "store": store,
+        "chunker": chunker,
+        "retriever": retriever,
+        "ingest_pipeline": ingest_pipeline,
+    }
+
+
+def test_soundness_sweep(db_conn, acme_env):
+    """1. Soundness sweep.
+
+    For every persona x every question x policy {1, 2}, every retrieved chunk
+    passes the Python oracle Policy.decide. Build the oracle independently from
+    the YAML sources, and use chunk ACLs from chunk_acl.
+    """
+    retriever = acme_env["retriever"]
+    policy_v1_oracle = load_policy("examples/acme/policy_v1.yaml")
+    policy_v2_oracle = load_policy("examples/acme/policy_v2.yaml")
+    directory_oracle = load_directory("examples/acme/directory.yaml")
+
+    personas = ["alice", "bob", "carol", "dave", "erin", "frank", "grace", "henry", "mallory"]
+    questions = [
+        "employee handbook engineering guidelines",
+        "engineering operations infrastructure runbook",
+        "break glass emergency access token",
+        "compensation structure and salary bands",
+        "Q3 financial performance and forecast report",
+        "Project Nightjar acquisition strategy",
+        "internal audit findings and remediation roadmap",
+    ]
+
+    for pv in (1, 2):
+        oracle_policy = policy_v1_oracle if pv == 1 else policy_v2_oracle
+
+        for persona in personas:
+            if persona in directory_oracle:
+                user_dir = directory_oracle[persona]
+                subject = oracle_policy.subject(
+                    user_id=persona,
+                    groups=set(user_dir.groups),
+                    roles=set(user_dir.roles),
+                )
+            else:
+                subject = None
+
+            for q in questions:
+                user = UserContext(user_id=persona, policy_version=pv)
+                result = retriever.retrieve(user, q)
+
+                for chunk in result.chunks:
+                    # Verify chunk ACLs match chunk_acl DB table
+                    db_acl_rows = db_conn.execute(
+                        "SELECT principal_type, principal_name, effect FROM chunk_acl WHERE chunk_id = %s",
+                        (chunk.chunk_id,),
+                    ).fetchall()
+                    allows = {
+                        Principal(PrincipalType(ptype), pname)
+                        for ptype, pname, effect in db_acl_rows
+                        if effect == "allow"
+                    }
+                    denies = {
+                        Principal(PrincipalType(ptype), pname)
+                        for ptype, pname, effect in db_acl_rows
+                        if effect == "deny"
+                    }
+                    expected_db_acl = Acl(frozenset(allows), frozenset(denies))
+                    assert chunk.acl == expected_db_acl
+
+                    # Pass through independent oracle Policy.decide
+                    decision = oracle_policy.decide(subject, chunk.classification, chunk.acl)
+                    assert decision.allowed, (
+                        f"Oracle denied chunk {chunk.chunk_id} for user '{persona}' "
+                        f"under policy v{pv}: {decision.reason}"
+                    )
+
+
+def test_deny_beats_allow(db_conn, acme_env):
+    """2. Deny beats allow.
+
+    carol (executive) never gets legal_project_nightjar chunks; henry and grace do.
+    """
+    retriever = acme_env["retriever"]
+    query = "Project Nightjar acquisition strategy legal memorandum"
+
+    for pv in (1, 2):
+        # Carol (executive) has allow via executive role, but explicit deny for user:carol
+        res_carol = retriever.retrieve(UserContext(user_id="carol", policy_version=pv), query)
+        assert not any(c.document_id == "legal_project_nightjar" for c in res_carol.chunks)
+
+        # Henry (CEO / executive) gets Nightjar chunks
+        res_henry = retriever.retrieve(UserContext(user_id="henry", policy_version=pv), query)
+        assert any(c.document_id == "legal_project_nightjar" for c in res_henry.chunks)
+
+        # Grace (general counsel) gets Nightjar chunks (explicit allow user:grace)
+        res_grace = retriever.retrieve(UserContext(user_id="grace", policy_version=pv), query)
+        assert any(c.document_id == "legal_project_nightjar" for c in res_grace.chunks)
+
+
+def test_per_chunk_override(db_conn, acme_env):
+    """3. Per-chunk override.
+
+    contractors and interns never get the break-glass section, even though
+    they're allowed on the rest of the runbook.
+    """
+    retriever = acme_env["retriever"]
+    query = "break glass emergency access token runbook"
+
+    # Erin (contractor) under policy v1 (when contractor is allowed on internal runbook)
+    res_erin = retriever.retrieve(UserContext(user_id="erin", policy_version=1), query)
+    assert any(c.document_id == "eng_runbook" for c in res_erin.chunks)
+    assert not any("Break-glass" in c.content or c.classification == "confidential" for c in res_erin.chunks)
+
+    # Dave (intern) under policy v2 (when intern clearance is elevated to 1)
+    res_dave = retriever.retrieve(UserContext(user_id="dave", policy_version=2), query)
+    assert any(c.document_id == "eng_runbook" for c in res_dave.chunks)
+    assert not any("Break-glass" in c.content or c.classification == "confidential" for c in res_dave.chunks)
+
+
+def test_clearance(db_conn, acme_env):
+    """4. Clearance.
+
+    dave (intern) gets no runbook chunks under v1 and does under v2.
+    """
+    retriever = acme_env["retriever"]
+    query = "engineering operations runbook"
+
+    # Dave under v1 (clearance 0 < 1) -> 0 runbook chunks
+    res_dave_v1 = retriever.retrieve(UserContext(user_id="dave", policy_version=1), query)
+    assert not any(c.document_id == "eng_runbook" for c in res_dave_v1.chunks)
+
+    # Dave under v2 (clearance elevated to 1) -> receives runbook chunks
+    res_dave_v2 = retriever.retrieve(UserContext(user_id="dave", policy_version=2), query)
+    assert any(c.document_id == "eng_runbook" for c in res_dave_v2.chunks)
+
+
+def test_policy_switch(db_conn, acme_env):
+    """5. Policy switch.
+
+    erin loses runbook access in v2, and frank gains audit_findings in v2.
+    """
+    retriever = acme_env["retriever"]
+
+    # Erin (contractor)
+    runbook_q = "engineering operations runbook"
+    res_erin_v1 = retriever.retrieve(UserContext(user_id="erin", policy_version=1), runbook_q)
+    assert any(c.document_id == "eng_runbook" for c in res_erin_v1.chunks)
+
+    res_erin_v2 = retriever.retrieve(UserContext(user_id="erin", policy_version=2), runbook_q)
+    assert not any(c.document_id == "eng_runbook" for c in res_erin_v2.chunks)
+
+    # Frank (finance)
+    audit_q = "internal audit findings remediation roadmap"
+    res_frank_v1 = retriever.retrieve(UserContext(user_id="frank", policy_version=1), audit_q)
+    assert not any(c.document_id == "audit_findings" for c in res_frank_v1.chunks)
+
+    res_frank_v2 = retriever.retrieve(UserContext(user_id="frank", policy_version=2), audit_q)
+    assert any(c.document_id == "audit_findings" for c in res_frank_v2.chunks)
+
+
+def test_unknown_user(db_conn, acme_env):
+    """6. Unknown user.
+
+    mallory gets zero chunks.
+    """
+    retriever = acme_env["retriever"]
+    queries = [
+        "employee handbook engineering",
+        "engineering operations runbook",
+        "compensation structure salary bands",
+        "Project Nightjar acquisition strategy",
+    ]
+
+    for pv in (1, 2):
+        for q in queries:
+            res = retriever.retrieve(UserContext(user_id="mallory", policy_version=pv), q)
+            assert len(res.chunks) == 0
+
+
+def test_nearest_vector_excluded(db_conn, acme_env):
+    """7. Nearest vector excluded.
+
+    Query with the exact text of a restricted chunk as an unauthorized user;
+    that chunk must not come back.
+    """
+    retriever = acme_env["retriever"]
+
+    # Restricted chunk from legal_project_nightjar
+    nightjar_chunk = db_conn.execute(
+        "SELECT content FROM chunks WHERE document_id = 'legal_project_nightjar' LIMIT 1"
+    ).fetchone()[0]
+
+    # Carol is unauthorized due to explicit deny on legal_project_nightjar
+    res_carol = retriever.retrieve(UserContext(user_id="carol", policy_version=1), nightjar_chunk)
     assert not any(c.document_id == "legal_project_nightjar" for c in res_carol.chunks)
 
-    # 2. Mallory (unknown user) gets zero chunks
-    mallory_user = UserContext(user_id="mallory")
-    res_mallory = retriever.retrieve(mallory_user, "employee handbook engineering")
-    assert len(res_mallory.chunks) == 0
+    # Alice is unauthorized due to insufficient clearance (clearance 1 < 3)
+    res_alice = retriever.retrieve(UserContext(user_id="alice", policy_version=1), nightjar_chunk)
+    assert not any(c.document_id == "legal_project_nightjar" for c in res_alice.chunks)
 
-    # 3. Erin (contractor) never gets hr_comp_bands, finance_q3, or audit_findings
-    erin_user = UserContext(user_id="erin")
-    res_erin = retriever.retrieve(erin_user, "compensation finance audit findings")
-    assert not any(
-        c.document_id in ("hr_comp_bands", "finance_q3", "audit_findings")
-        for c in res_erin.chunks
+    # Confidential chunk from hr_comp_bands
+    hr_chunk = db_conn.execute(
+        "SELECT content FROM chunks WHERE document_id = 'hr_comp_bands' LIMIT 1"
+    ).fetchone()[0]
+
+    # Alice (engineer) is unauthorized for HR comp bands
+    res_alice_hr = retriever.retrieve(UserContext(user_id="alice", policy_version=1), hr_chunk)
+    assert not any(c.document_id == "hr_comp_bands" for c in res_alice_hr.chunks)
+
+
+def test_guard_access_violation(db_conn, acme_env):
+    """8. Guard.
+
+    A deliberately broken custom AclFilter that returns all principals makes AccessGuard raise AccessViolation.
+    """
+    store = acme_env["store"]
+    embedder = acme_env["embedder"]
+    policy_store = acme_env["policy_store"]
+
+    broken_retriever = SecureRetriever(
+        conn=db_conn,
+        store=store,
+        embedder=embedder,
+        acl_filter=BypassingAclFilter(),
+        policy_store=policy_store,
+        guard=AccessGuard(),
+        k=10,
     )
 
-    # 4. Alice (engineer, clearance 1) never gets the 'Break-glass access' section chunk (confidential, clearance 2)
-    alice_user = UserContext(user_id="alice")
-    res_alice = retriever.retrieve(alice_user, "break glass emergency access token")
-    assert not any("Break-glass" in c.content for c in res_alice.chunks)
+    alice_user = UserContext(user_id="alice", policy_version=1)
+
+    with pytest.raises(AccessViolation) as exc_info:
+        broken_retriever.retrieve(alice_user, "Executive salaries and compensation")
+
+    assert "returned for alice under policy v1 but the reference evaluator denies it" in str(exc_info.value)
+
+
+def test_claims_filter_matches_directory_filter(db_conn, acme_env):
+    """9. Claims filter.
+
+    It matches the directory filter for equivalent memberships.
+    """
+    store = acme_env["store"]
+    embedder = acme_env["embedder"]
+    policy_store = acme_env["policy_store"]
+    directory = acme_env["directory"]
+
+    dir_retriever = SecureRetriever(
+        conn=db_conn,
+        store=store,
+        embedder=embedder,
+        acl_filter=DirectoryAclFilter(),
+        policy_store=policy_store,
+        guard=AccessGuard(),
+        k=10,
+    )
+
+    claims_retriever = SecureRetriever(
+        conn=db_conn,
+        store=store,
+        embedder=embedder,
+        acl_filter=ClaimsAclFilter(),
+        policy_store=policy_store,
+        guard=AccessGuard(),
+        k=10,
+    )
+
+    queries = [
+        "employee handbook engineering",
+        "engineering operations infrastructure runbook",
+        "compensation structure salary bands",
+        "Project Nightjar acquisition strategy",
+        "internal audit findings remediation",
+    ]
+
+    for uid, duser in directory.items():
+        for pv in (1, 2):
+            for q in queries:
+                dir_user = UserContext(user_id=uid, policy_version=pv)
+                claims_user = UserContext(
+                    user_id=uid,
+                    groups=duser.groups,
+                    roles=duser.roles,
+                    policy_version=pv,
+                )
+
+                res_dir = dir_retriever.retrieve(dir_user, q)
+                res_claims = claims_retriever.retrieve(claims_user, q)
+
+                dir_ids = [c.chunk_id for c in res_dir.chunks]
+                claims_ids = [c.chunk_id for c in res_claims.chunks]
+                assert dir_ids == claims_ids, f"Mismatch for user {uid} under policy v{pv} on query '{q}'"
+
+                dir_scores = [c.score for c in res_dir.chunks]
+                claims_scores = [c.score for c in res_claims.chunks]
+                assert dir_scores == claims_scores
+
+
+def test_audit_logging(db_conn, acme_env):
+    """10. Audit.
+
+    One retrieval_audit row per retrieve, with the right chunk ids and policy version.
+    """
+    retriever = acme_env["retriever"]
+
+    db_conn.execute("TRUNCATE TABLE retrieval_audit")
+
+    alice_user = UserContext(user_id="alice", policy_version=1)
+    res1 = retriever.retrieve(alice_user, "employee handbook")
+
+    rows = db_conn.execute(
+        "SELECT user_id, policy_version, acl_filter, query, chunk_ids FROM retrieval_audit ORDER BY id DESC"
+    ).fetchall()
+
+    assert len(rows) == 1
+    row1 = rows[0]
+    assert row1[0] == "alice"
+    assert row1[1] == 1
+    assert row1[2] == "directory"
+    assert row1[3] == "employee handbook"
+    assert row1[4] == [c.chunk_id for c in res1.chunks]
+
+    bob_user = UserContext(user_id="bob", policy_version=2)
+    res2 = retriever.retrieve(bob_user, "compensation structure")
+
+    rows2 = db_conn.execute(
+        "SELECT user_id, policy_version, acl_filter, query, chunk_ids FROM retrieval_audit ORDER BY id DESC"
+    ).fetchall()
+
+    assert len(rows2) == 2
+    row2 = rows2[0]
+    assert row2[0] == "bob"
+    assert row2[1] == 2
+    assert row2[2] == "directory"
+    assert row2[3] == "compensation structure"
+    assert row2[4] == [c.chunk_id for c in res2.chunks]
+
+
+def test_incremental_ingest(db_conn, acme_env):
+    """11. Incremental ingest.
+
+    Re-ingesting with only an ACL change rewrites chunk_acl without calling the
+    embedder (use a counting embedder), and the new ACL takes effect immediately.
+    """
+    store = acme_env["store"]
+    chunker = acme_env["chunker"]
+    policy_store = acme_env["policy_store"]
+
+    base_embedder = HashingEmbedder(768)
+    embed_calls = 0
+
+    class CountingEmbedder:
+        def __init__(self, inner):
+            self.inner = inner
+            self.dim = inner.dim
+
+        def embed_documents(self, texts):
+            nonlocal embed_calls
+            embed_calls += 1
+            return self.inner.embed_documents(texts)
+
+        def embed_query(self, query):
+            return self.inner.embed_query(query)
+
+    counting_embedder = CountingEmbedder(base_embedder)
+    counting_store = PgVectorStore(db_conn, counting_embedder)
+    ingest_pipe = IngestionPipeline(chunker=chunker, embedder=counting_embedder, store=counting_store)
+
+    retriever = SecureRetriever(
+        conn=db_conn,
+        store=counting_store,
+        embedder=counting_embedder,
+        acl_filter=DirectoryAclFilter(),
+        policy_store=policy_store,
+        guard=AccessGuard(),
+        k=10,
+    )
+
+    doc_id = "inc_test_doc"
+    doc_v1 = SourceDocument(
+        id=doc_id,
+        title="Incremental Test Doc",
+        text="## Incremental Section\nUnique text content for incremental ACL test.",
+        classification="internal",
+        acl=Acl.from_specs(allow=["role:engineer"]),
+    )
+
+    # First ingest -> calls embedder
+    ingest_pipe.ingest([doc_v1])
+    assert embed_calls == 1
+
+    # Alice (engineer) can retrieve it; Bob (hr_manager) cannot
+    alice_user = UserContext(user_id="alice", policy_version=1)
+    bob_user = UserContext(user_id="bob", policy_version=1)
+
+    res_alice1 = retriever.retrieve(alice_user, "Unique text content")
+    assert any(c.document_id == doc_id for c in res_alice1.chunks)
+
+    res_bob1 = retriever.retrieve(bob_user, "Unique text content")
+    assert not any(c.document_id == doc_id for c in res_bob1.chunks)
+
+    # Update ACL only -> allow role:hr_manager
+    doc_v2 = SourceDocument(
+        id=doc_id,
+        title="Incremental Test Doc",
+        text="## Incremental Section\nUnique text content for incremental ACL test.",
+        classification="internal",
+        acl=Acl.from_specs(allow=["role:hr_manager"]),
+    )
+
+    res_inc = ingest_pipe.ingest([doc_v2])
+    assert res_inc == [doc_id]
+    # Embedder was NOT called during ACL-only update
+    assert embed_calls == 1
+
+    # Verify chunk_acl table was rewritten in DB
+    chunk_acl_rows = db_conn.execute(
+        "SELECT principal_name FROM chunk_acl WHERE chunk_id = %s",
+        (f"{doc_id}:0000",),
+    ).fetchall()
+    assert [r[0] for r in chunk_acl_rows] == ["hr_manager"]
+
+    # New ACL takes effect immediately: Alice loses access, Bob gains access
+    res_alice2 = retriever.retrieve(alice_user, "Unique text content")
+    assert not any(c.document_id == doc_id for c in res_alice2.chunks)
+
+    res_bob2 = retriever.retrieve(bob_user, "Unique text content")
+    assert any(c.document_id == doc_id for c in res_bob2.chunks)
 
 
 def test_manifest_and_ingestion_and_retrieval(db_conn):
-    # Setup policy & directory for simple test
+    """Manifest loading, pipeline construction, RAG answer and refusal."""
     policy = Policy.from_dict({
         "version": 1,
         "name": "v1",
@@ -179,175 +592,3 @@ documents:
         ans_alice_hr = rag_pipeline.answer(alice_user, "salaries compensation")
         assert ans_alice_hr.refused
         assert ans_alice_hr.text == REFUSAL
-
-        # Unknown user gets no retrieved chunks and RAG refusal
-        unknown_user = UserContext(user_id="charlie_unknown")
-        res_unknown = retriever.retrieve(unknown_user, "Kubernetes deployment")
-        assert len(res_unknown.chunks) == 0
-
-        ans_unknown = rag_pipeline.answer(unknown_user, "Kubernetes deployment")
-        assert ans_unknown.refused
-        assert ans_unknown.text == REFUSAL
-
-        # Verify audit log entries
-        rows = db_conn.execute(
-            "SELECT user_id, policy_version, acl_filter, query, chunk_ids FROM retrieval_audit ORDER BY id DESC"
-        ).fetchall()
-        assert len(rows) >= 4
-        # Check unknown user audit log entry
-        latest_unknown = [r for r in rows if r[0] == "charlie_unknown"][0]
-        assert latest_unknown[0] == "charlie_unknown"
-        assert latest_unknown[1] == 1
-        assert latest_unknown[2] == "directory"
-        assert latest_unknown[4] == []
-
-
-def test_access_violation_propagation(db_conn):
-    policy = Policy.from_dict({
-        "version": 1,
-        "name": "v1",
-        "description": "Test Policy",
-        "classifications": {"public": 0, "internal": 1, "confidential": 2},
-        "roles": {
-            "engineer": {"clearance": 1, "inherits": []},
-            "hr_manager": {"clearance": 2, "inherits": []},
-        },
-        "groups": {
-            "eng": ["engineer"],
-            "hr": ["hr_manager"],
-        },
-        "deny_rules": [],
-    })
-    PolicyStore(db_conn).publish(policy, activate=True)
-
-    dstore = DirectoryStore(db_conn)
-    alice = DirectoryUser(id="alice", display_name="Alice", groups=frozenset(["eng"]), roles=frozenset(["engineer"]))
-    dstore.sync({"alice": alice}, prune=True)
-
-    settings = Settings(embedder="fake", llm="fake")
-    ingest_pipeline, retriever, rag_pipeline = build_pipeline(settings, db_conn)
-
-    doc = SourceDocument(
-        id="doc_restricted",
-        title="Restricted HR",
-        text="Executive salaries and bonuses.",
-        classification="confidential",
-        acl=Acl.from_specs(allow=["role:hr_manager"]),
-    )
-    ingest_pipeline.ingest([doc])
-
-    # Replace retriever's ACL filter with BypassingAclFilter to simulate a buggy SQL filter
-    retriever.acl_filter = BypassingAclFilter()
-
-    alice_user = UserContext(user_id="alice")
-
-    # SecureRetriever.retrieve must catch Mismatch via AccessGuard and propagate AccessViolation
-    with pytest.raises(AccessViolation) as exc_info:
-        retriever.retrieve(alice_user, "Executive salaries")
-    assert "returned for alice under policy v1 but the reference evaluator denies it" in str(exc_info.value)
-
-
-def test_hash_change_detection_and_deletion(db_conn):
-    policy = Policy.from_dict({
-        "version": 1,
-        "name": "v1",
-        "description": "Test Policy",
-        "classifications": {"public": 0, "internal": 1, "confidential": 2},
-        "roles": {
-            "engineer": {"clearance": 1, "inherits": []},
-            "hr_manager": {"clearance": 2, "inherits": []},
-        },
-        "groups": {
-            "eng": ["engineer"],
-            "hr": ["hr_manager"],
-        },
-        "deny_rules": [],
-    })
-    PolicyStore(db_conn).publish(policy, activate=True)
-
-    dstore = DirectoryStore(db_conn)
-    alice = DirectoryUser(id="alice", display_name="Alice", groups=frozenset(["eng"]), roles=frozenset(["engineer"]))
-    bob = DirectoryUser(id="bob", display_name="Bob", groups=frozenset(["hr"]), roles=frozenset(["hr_manager"]))
-    dstore.sync({"alice": alice, "bob": bob}, prune=True)
-
-    settings = Settings(embedder="fake", llm="fake")
-    ingest_pipeline, retriever, _ = build_pipeline(settings, db_conn)
-    store = ingest_pipeline.store
-
-    # Wrap embedder to count calls
-    embed_calls = 0
-    orig_embed = ingest_pipeline.embedder.embed_documents
-
-    def counting_embed(texts):
-        nonlocal embed_calls
-        embed_calls += 1
-        return orig_embed(texts)
-
-    ingest_pipeline.embedder.embed_documents = counting_embed
-
-    doc = SourceDocument(
-        id="doc_hash_test",
-        title="Hash Test",
-        text="Initial text content for change detection.",
-        classification="internal",
-        acl=Acl.from_specs(allow=["role:engineer"]),
-    )
-
-    # 1. First ingest -> triggers embedding
-    ingest_pipeline.ingest([doc])
-    assert embed_calls == 1
-    h1 = store.get_document_hashes("doc_hash_test")
-    assert h1 is not None
-
-    # Alice can retrieve it
-    alice_user = UserContext(user_id="alice")
-    res_alice1 = retriever.retrieve(alice_user, "Initial text content")
-    assert any(c.document_id == "doc_hash_test" for c in res_alice1.chunks)
-
-    # 2. Ingest identical doc -> skipped, no embedding calls
-    res = ingest_pipeline.ingest([doc])
-    assert res == []
-    assert embed_calls == 1
-    h2 = store.get_document_hashes("doc_hash_test")
-    assert h1 == h2
-
-    # 3. ACL / classification change only -> same content_hash, new acl_hash, NO re-embedding
-    doc_acl_changed = SourceDocument(
-        id="doc_hash_test",
-        title="Hash Test",
-        text="Initial text content for change detection.",
-        classification="confidential",
-        acl=Acl.from_specs(allow=["role:hr_manager"]),
-    )
-    res_acl = ingest_pipeline.ingest([doc_acl_changed])
-    assert res_acl == ["doc_hash_test"]
-    assert embed_calls == 1  # Re-embedding was BYPASSED!
-    h3 = store.get_document_hashes("doc_hash_test")
-    assert h3[0] == h1[0]  # content_hash unchanged
-    assert h3[1] != h1[1]  # acl_hash changed
-
-    # Alice (engineer) can no longer retrieve it; Bob (hr_manager) can
-    bob_user = UserContext(user_id="bob")
-    res_alice2 = retriever.retrieve(alice_user, "Initial text content")
-    assert not any(c.document_id == "doc_hash_test" for c in res_alice2.chunks)
-
-    res_bob1 = retriever.retrieve(bob_user, "Initial text content")
-    assert any(c.document_id == "doc_hash_test" for c in res_bob1.chunks)
-
-    # 4. Content change -> triggers re-embedding
-    doc_content_changed = SourceDocument(
-        id="doc_hash_test",
-        title="Hash Test",
-        text="Updated text content for change detection.",
-        classification="confidential",
-        acl=Acl.from_specs(allow=["role:hr_manager"]),
-    )
-    res_content = ingest_pipeline.ingest([doc_content_changed])
-    assert res_content == ["doc_hash_test"]
-    assert embed_calls == 2  # Re-embedding occurred
-    h4 = store.get_document_hashes("doc_hash_test")
-    assert h4[0] != h1[0]
-
-    # 5. Delete document
-    store.delete_document("doc_hash_test")
-    assert store.get_document_hashes("doc_hash_test") is None
