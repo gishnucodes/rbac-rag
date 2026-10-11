@@ -213,7 +213,7 @@ class PgVectorStore:
                   WHERE r.policy_version = %(pv)s AND r.classification = c.classification
               )
               {extra_where}
-            ORDER BY c.embedding <=> %(q)s::vector LIMIT %(k)s
+            ORDER BY c.embedding <=> %(q)s::vector, c.id LIMIT %(k)s
             """
 
             params = dict(fragment.params)
@@ -254,5 +254,5 @@ class PgVectorStore:
                 )
             )
 
-        results.sort(key=lambda x: x.score, reverse=True)
+        results.sort(key=lambda x: (-x.score, x.chunk_id))
         return results
