@@ -30,6 +30,7 @@ def save_report(
     md_path.write_text(md_content)
 
     print(f"\nReport saved:\n  JSON: {json_path}\n  Markdown: {md_path}\n")
+    print(md_content)
 
     return json_path, md_path
 
