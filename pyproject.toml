@@ -35,5 +35,6 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
+pythonpath = ["."]
 testpaths = ["tests"]
 markers = ["db: requires a reachable Postgres with pgvector (RBAC_RAG_TEST_DATABASE_URL)"]
