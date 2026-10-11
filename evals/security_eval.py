@@ -89,10 +89,9 @@ def run_security_eval(fake: bool = True, policies: list[int] | None = None) -> d
     }
 
     with connect(settings.database_url) as conn:
-        from rbac_rag.registry import get_embedder_factory
+        from rbac_rag.registry import get_embedder
 
-        embedder_factory = get_embedder_factory(settings.embedder)
-        embedder = embedder_factory(settings)
+        embedder = get_embedder(settings.embedder, settings)
         store = PgVectorStore(conn, embedder)
         policy_store = PolicyStore(conn)
         acl_filter = DirectoryAclFilter()
