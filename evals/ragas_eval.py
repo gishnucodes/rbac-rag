@@ -285,24 +285,28 @@ async def run_eval(
 
     log.info("Running evaluation on %d samples under policy v%d...", len(dataset), policy_version)
 
-    semaphore = asyncio.Semaphore(concurrency)
-
+    # First, generate answers sequentially or per thread with fresh connections to avoid DB connection sharing
+    samples_with_pipelines = []
     with connect(settings.database_url) as conn:
         _, _, rag_pipeline = build_pipeline(settings, conn)
+        for sample in dataset:
+            samples_with_pipelines.append((sample, rag_pipeline))
 
-        tasks = [
-            evaluate_sample(
-                sample=sample,
-                policy_version=policy_version,
-                rag_pipeline=rag_pipeline,
-                llm=llm,
-                ragas_embeddings=ragas_embeddings,
-                semaphore=semaphore,
-            )
-            for sample in dataset
-        ]
+    semaphore = asyncio.Semaphore(concurrency)
 
-        results = await asyncio.gather(*tasks)
+    tasks = [
+        evaluate_sample(
+            sample=sample,
+            policy_version=policy_version,
+            rag_pipeline=pipeline,
+            llm=llm,
+            ragas_embeddings=ragas_embeddings,
+            semaphore=semaphore,
+        )
+        for sample, pipeline in samples_with_pipelines
+    ]
+
+    results = await asyncio.gather(*tasks)
 
     # Compute Summary Statistics
     refusal_correct_count = sum(1 for r in results if r["refusal_correctness"])
