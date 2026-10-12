@@ -592,3 +592,72 @@ documents:
         ans_alice_hr = rag_pipeline.answer(alice_user, "salaries compensation")
         assert ans_alice_hr.refused
         assert ans_alice_hr.text == REFUSAL
+
+
+def test_delete_document(db_conn, acme_env):
+    """12. Delete document.
+
+    Ingest a document, verify it exists and its chunks are returned in retrieval,
+    then delete it via PgVectorStore.delete_document.
+    Assert store.get_document_hashes(doc_id) returns None, no chunk rows remain for doc_id,
+    retrieval returns no chunks for doc_id, and other documents remain intact.
+    """
+    store = acme_env["store"]
+    ingest_pipeline = acme_env["ingest_pipeline"]
+    retriever = acme_env["retriever"]
+
+    doc_id = "doc_to_delete"
+    doc = SourceDocument(
+        id=doc_id,
+        title="Document To Delete",
+        text="## Temporary Document\nThis document will be deleted and tested.",
+        classification="internal",
+        acl=Acl.from_specs(allow=["role:engineer"]),
+    )
+
+    ingest_pipeline.ingest([doc])
+
+    # Document and chunks exist prior to deletion
+    assert store.get_document_hashes(doc_id) is not None
+    alice_user = UserContext(user_id="alice", policy_version=1)
+    res_before = retriever.retrieve(alice_user, "Temporary Document")
+    assert any(c.document_id == doc_id for c in res_before.chunks)
+
+    chunks_before = db_conn.execute(
+        "SELECT COUNT(*) FROM chunks WHERE document_id = %s", (doc_id,)
+    ).fetchone()[0]
+    assert chunks_before > 0
+
+    # Ensure other documents exist
+    other_doc_id = "handbook"
+    assert store.get_document_hashes(other_doc_id) is not None
+    other_chunks_before = db_conn.execute(
+        "SELECT COUNT(*) FROM chunks WHERE document_id = %s", (other_doc_id,)
+    ).fetchone()[0]
+    assert other_chunks_before > 0
+
+    # Perform deletion
+    store.delete_document(doc_id)
+
+    # 1. Document hashes return None
+    assert store.get_document_hashes(doc_id) is None
+
+    # 2. Secure search / retrieval returns no chunks for deleted doc
+    res_after = retriever.retrieve(alice_user, "Temporary Document")
+    assert not any(c.document_id == doc_id for c in res_after.chunks)
+
+    # 3. No chunk rows remain for deleted doc (cascade)
+    chunks_after = db_conn.execute(
+        "SELECT COUNT(*) FROM chunks WHERE document_id = %s", (doc_id,)
+    ).fetchone()[0]
+    assert chunks_after == 0
+
+    # 4. Other documents are untouched
+    assert store.get_document_hashes(other_doc_id) is not None
+    other_chunks_after = db_conn.execute(
+        "SELECT COUNT(*) FROM chunks WHERE document_id = %s", (other_doc_id,)
+    ).fetchone()[0]
+    assert other_chunks_after == other_chunks_before
+
+    other_retrieved = retriever.retrieve(alice_user, "employee handbook")
+    assert any(c.document_id == other_doc_id for c in other_retrieved.chunks)
