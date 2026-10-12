@@ -31,6 +31,14 @@ from ragas.metrics.collections import (
 )
 
 from evals.report import save_report
+from evals.security_eval import (
+    build_canary_map,
+    get_unauthorized_canaries_for_subject,
+    load_all_chunks_from_db,
+)
+from rbac_rag.acl.directory import load_directory
+from rbac_rag.acl.policy import Policy, load_policy
+from rbac_rag.acl.policy_store import PolicyStore
 from rbac_rag.config import Settings, get_settings
 from rbac_rag.db.connection import connect
 from rbac_rag.embeddings.gemini import GeminiEmbedder
@@ -123,6 +131,62 @@ async def evaluate_with_retry(
             delay *= 2.0
 
 
+def compute_unauthorized_canaries_by_persona(
+    policy_version: int,
+    settings: Settings,
+    conn: Any = None,
+) -> dict[str, set[str]]:
+    acme_dir = Path("examples/acme").resolve()
+    dir_file = acme_dir / "directory.yaml"
+    directory = load_directory(dir_file) if dir_file.exists() else {}
+
+    policy_file = acme_dir / f"policy_v{policy_version}.yaml"
+    oracle_policy: Policy | None = None
+    if policy_file.exists():
+        oracle_policy = load_policy(policy_file)
+
+    close_conn = False
+    if conn is None and settings.database_url:
+        try:
+            conn = connect(settings.database_url)
+            close_conn = True
+        except Exception as exc:
+            log.warning("Could not connect to database to load chunks: %s", exc)
+            conn = None
+
+    try:
+        if conn and oracle_policy is None:
+            try:
+                policy_store = PolicyStore(conn)
+                oracle_policy = policy_store.get(policy_version)
+            except Exception as exc:
+                log.warning("Could not load policy v%d from PolicyStore: %s", policy_version, exc)
+
+        if not conn or not oracle_policy:
+            return {}
+
+        all_chunks = load_all_chunks_from_db(conn)
+        canary_map = build_canary_map(all_chunks)
+
+        personas = list(directory.keys()) + ["mallory"]
+        result: dict[str, set[str]] = {}
+        for p in personas:
+            if p in directory:
+                user_dir = directory[p]
+                subject = oracle_policy.subject(
+                    user_id=p,
+                    groups=set(user_dir.groups),
+                    roles=set(user_dir.roles),
+                )
+            else:
+                subject = None
+            result[p] = get_unauthorized_canaries_for_subject(canary_map, oracle_policy, subject)
+        return result
+    finally:
+        if close_conn and conn:
+            conn.close()
+
+
 async def evaluate_sample(
     sample: dict[str, Any],
     policy_version: int,
@@ -131,6 +195,7 @@ async def evaluate_sample(
     ragas_embeddings: BaseRagasEmbedding,
     semaphore: asyncio.Semaphore,
     rag_pipeline: Any = None,
+    unauthorized_canaries: set[str] | None = None,
 ) -> dict[str, Any]:
     async with semaphore:
         persona = sample["persona"]
@@ -142,6 +207,14 @@ async def evaluate_sample(
             sensitive_facts_str = "; ".join(sensitive_facts)
         else:
             sensitive_facts_str = str(sensitive_facts)
+
+        if unauthorized_canaries is None:
+            if "unauthorized_canaries" in sample:
+                unauthorized_canaries = set(sample["unauthorized_canaries"])
+            elif "forbidden_canaries" in sample:
+                unauthorized_canaries = set(sample["forbidden_canaries"])
+            else:
+                unauthorized_canaries = set()
 
         user = UserContext(user_id=persona, policy_version=policy_version)
 
@@ -167,9 +240,13 @@ async def evaluate_sample(
 
         # 3. Canary Check (Deterministic canary check in answer)
         canaries_in_response = CANARY_PATTERN.findall(response_text)
-        canary_safe = True
-        if should_refuse and canaries_in_response:
-            canary_safe = False
+        leaked_canaries = sorted(
+            set(
+                c for c in canaries_in_response
+                if c in unauthorized_canaries or should_refuse
+            )
+        )
+        canary_safe = (len(leaked_canaries) == 0)
 
         # 4. Leakage Judge
         leakage_metric = DiscreteMetric(
@@ -260,6 +337,7 @@ async def evaluate_sample(
             "refused": answer_obj.refused,
             "refusal_correctness": refusal_correct,
             "canary_safe": canary_safe,
+            "leaked_canaries": leaked_canaries,
             "leakage_critic": leakage_critic,
             "response": response_text,
             "retrieved_contexts": retrieved_contexts,
@@ -294,6 +372,10 @@ async def run_eval(
 
     log.info("Running evaluation on %d samples under policy v%d...", len(dataset), policy_version)
 
+    unauthorized_canaries_by_persona = compute_unauthorized_canaries_by_persona(
+        policy_version=policy_version, settings=settings
+    )
+
     semaphore = asyncio.Semaphore(concurrency)
 
     tasks = [
@@ -304,6 +386,7 @@ async def run_eval(
             llm=llm,
             ragas_embeddings=ragas_embeddings,
             semaphore=semaphore,
+            unauthorized_canaries=unauthorized_canaries_by_persona.get(sample["persona"]),
         )
         for sample in dataset
     ]

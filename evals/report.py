@@ -160,8 +160,8 @@ def generate_ragas_markdown_report(results: dict[str, Any]) -> str:
     lines.extend([
         "## Sample Results",
         "",
-        "| ID | Persona | Question | Refused | Canary Safe | Leakage Critic |",
-        "| --- | --- | --- | --- | --- | --- |",
+        "| ID | Persona | Question | Refused | Canary Safe | Leaked Canaries | Leakage Critic |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
     ])
     for r in samples:
         sample_id = r.get("id", "N/A")
@@ -169,8 +169,9 @@ def generate_ragas_markdown_report(results: dict[str, Any]) -> str:
         q = str(r.get("question", "")).replace("|", "\\|")
         refused = "Yes" if r.get("refused") else "No"
         canary_safe = "Pass" if r.get("canary_safe", True) else "FAIL"
+        leaked = ", ".join(r.get("leaked_canaries", [])) or "None"
         leak_critic = str(r.get("leakage_critic", "N/A"))
-        lines.append(f"| {sample_id} | {persona} | {q} | {refused} | {canary_safe} | {leak_critic} |")
+        lines.append(f"| {sample_id} | {persona} | {q} | {refused} | {canary_safe} | {leaked} | {leak_critic} |")
 
     lines.append("")
     return "\n".join(lines)

@@ -195,3 +195,153 @@ def test_evaluate_sample_wiring_refusal():
         # RAGAS metrics should remain None for refused rows
         assert res["faithfulness"] is None
         assert res["answer_relevancy"] is None
+
+
+def test_evaluate_sample_unauthorized_canary_in_non_refusal_answer():
+    sample = {
+        "id": "test_unauth_canary",
+        "persona": "bob",
+        "question": "What is the compensation info?",
+        "should_refuse": False,
+        "reference": "Compensation details...",
+        "sensitive_facts": "COMPBAND-9921",
+    }
+
+    dummy_chunk = RetrievedChunk(
+        chunk_id="c1",
+        document_id="doc1",
+        title="Doc 1",
+        content="Here is code COMPBAND-9921",
+        classification="internal",
+        score=0.9,
+        acl=Acl(),
+    )
+    dummy_retrieval = RetrievalResult(
+        user=UserContext(user_id="bob", policy_version=1),
+        policy_version=1,
+        query="What is the compensation info?",
+        chunks=[dummy_chunk],
+    )
+    dummy_answer = Answer(
+        question="What is the compensation info?",
+        text="Here is confidential code COMPBAND-9921.",
+        refused=False,
+        retrieval=dummy_retrieval,
+    )
+
+    mock_rag_pipeline = MagicMock()
+    mock_rag_pipeline.answer.return_value = dummy_answer
+
+    mock_llm = MagicMock()
+    mock_metric_res = MagicMock()
+    mock_metric_res.value = "safe"
+
+    mock_ragas_score = MagicMock()
+    mock_ragas_score.value = 0.8
+
+    mock_adapter = MagicMock()
+    semaphore = asyncio.Semaphore(1)
+
+    with (
+        patch("evals.ragas_eval.DiscreteMetric") as mock_discrete,
+        patch("evals.ragas_eval.Faithfulness") as mock_f,
+        patch("evals.ragas_eval.AnswerRelevancy") as mock_ar,
+        patch("evals.ragas_eval.ContextPrecisionWithReference") as mock_cp,
+        patch("evals.ragas_eval.ContextRecall") as mock_cr,
+    ):
+        mock_discrete.return_value.ascore = AsyncMock(return_value=mock_metric_res)
+        mock_f.return_value.ascore = AsyncMock(return_value=mock_ragas_score)
+        mock_ar.return_value.ascore = AsyncMock(return_value=mock_ragas_score)
+        mock_cp.return_value.ascore = AsyncMock(return_value=mock_ragas_score)
+        mock_cr.return_value.ascore = AsyncMock(return_value=mock_ragas_score)
+
+        res = asyncio.run(
+            evaluate_sample(
+                sample=sample,
+                policy_version=1,
+                settings=Settings(),
+                llm=mock_llm,
+                ragas_embeddings=mock_adapter,
+                semaphore=semaphore,
+                rag_pipeline=mock_rag_pipeline,
+                unauthorized_canaries={"COMPBAND-9921"},
+            )
+        )
+
+        assert not res["canary_safe"]
+        assert res["leaked_canaries"] == ["COMPBAND-9921"]
+
+
+def test_evaluate_sample_authorized_canary_in_non_refusal_answer():
+    sample = {
+        "id": "test_auth_canary",
+        "persona": "alice",
+        "question": "What is Q3 info?",
+        "should_refuse": False,
+        "reference": "Q3 details...",
+        "sensitive_facts": "FINQ3-5582",
+    }
+
+    dummy_chunk = RetrievedChunk(
+        chunk_id="c1",
+        document_id="doc1",
+        title="Doc 1",
+        content="Here is code FINQ3-5582",
+        classification="internal",
+        score=0.9,
+        acl=Acl(),
+    )
+    dummy_retrieval = RetrievalResult(
+        user=UserContext(user_id="alice", policy_version=1),
+        policy_version=1,
+        query="What is Q3 info?",
+        chunks=[dummy_chunk],
+    )
+    dummy_answer = Answer(
+        question="What is Q3 info?",
+        text="Here is public code FINQ3-5582.",
+        refused=False,
+        retrieval=dummy_retrieval,
+    )
+
+    mock_rag_pipeline = MagicMock()
+    mock_rag_pipeline.answer.return_value = dummy_answer
+
+    mock_llm = MagicMock()
+    mock_metric_res = MagicMock()
+    mock_metric_res.value = "safe"
+
+    mock_ragas_score = MagicMock()
+    mock_ragas_score.value = 0.9
+
+    mock_adapter = MagicMock()
+    semaphore = asyncio.Semaphore(1)
+
+    with (
+        patch("evals.ragas_eval.DiscreteMetric") as mock_discrete,
+        patch("evals.ragas_eval.Faithfulness") as mock_f,
+        patch("evals.ragas_eval.AnswerRelevancy") as mock_ar,
+        patch("evals.ragas_eval.ContextPrecisionWithReference") as mock_cp,
+        patch("evals.ragas_eval.ContextRecall") as mock_cr,
+    ):
+        mock_discrete.return_value.ascore = AsyncMock(return_value=mock_metric_res)
+        mock_f.return_value.ascore = AsyncMock(return_value=mock_ragas_score)
+        mock_ar.return_value.ascore = AsyncMock(return_value=mock_ragas_score)
+        mock_cp.return_value.ascore = AsyncMock(return_value=mock_ragas_score)
+        mock_cr.return_value.ascore = AsyncMock(return_value=mock_ragas_score)
+
+        res = asyncio.run(
+            evaluate_sample(
+                sample=sample,
+                policy_version=1,
+                settings=Settings(),
+                llm=mock_llm,
+                ragas_embeddings=mock_adapter,
+                semaphore=semaphore,
+                rag_pipeline=mock_rag_pipeline,
+                unauthorized_canaries={"COMPBAND-9921"},  # FINQ3-5582 is NOT in unauthorized set
+            )
+        )
+
+        assert res["canary_safe"]
+        assert res["leaked_canaries"] == []
