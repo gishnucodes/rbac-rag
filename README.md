@@ -151,21 +151,23 @@ Access evaluation follows strict deny-by-default logic across 6 rule types:
 
 ## Extending Components
 
-`rbac-rag` provides Protocol interfaces in `rbac_rag.interfaces`. Component factories try initializing with `cls(settings)` first, falling back to `cls()`.
+`rbac-rag` provides Protocol interfaces in `rbac_rag.interfaces`. When loading custom classes specified as `pkg.module:Class`, the registry instantiates them by trying `cls(settings)` first and falling back to `cls()`.
 
 ### Custom `AclFilter` (e.g. Tenant Scoping)
 
 ```python
+import os
 from typing import Any
 from rbac_rag.acl.filters import DirectoryAclFilter
+from rbac_rag.config import Settings
 from rbac_rag.interfaces import SqlFragment, AclFilter
 from rbac_rag.types import UserContext
 
 class TenantAclFilter(AclFilter):
     name = "tenant"
 
-    def __init__(self, tenant_id: str = "acme"):
-        self.tenant_id = tenant_id
+    def __init__(self, settings: Settings | None = None):
+        self.tenant_id = os.environ.get("RBAC_RAG_TENANT_ID", "acme")
 
     def build(self, user: UserContext, policy_version: int) -> SqlFragment:
         return SqlFragment(
