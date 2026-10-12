@@ -24,7 +24,7 @@ GitHub MCP tools disconnect often. Reload with ToolSearch, for example `select:m
 
 ## 3. Status (as of 2026-10-12 ~03:40Z; verify live)
 **The original build is complete.** PRs #11-#20 are merged, sub-issues #2-#10 are closed, Waves 1-4 are ticked in #1, and CI is green on the default branch `claude/epic-lovelace-cucmn2` (`9b93519`). Re-verified at 03:40Z on a fresh pgvector DB: 48 tests pass (26 pass + 22 skip without the DB), `security_eval.py --fake --policies 1,2` reports leakage 0 (450 checks, 100% access recall, 0 canary exposures), and the README quickstart runs.
-- **Follow-up wave (in progress):** #21 (restore a `delete_document` DB test) and #22 (RAGAS canary check flags any unauthorized canary in every row) are filed and labelled `jules`. Review their PRs with the loop below; when both merge, close #1 and #14 per section 7.
+- **Follow-up wave (in progress, 04:25Z):** #21 is done (PR #23 squash-merged as `f84dd20`). #22 has PR #24 with **changes requested** (https://github.com/gishnucodes/rbac-rag/pull/24#issuecomment-6117681364): the canary check fails open when the persona map can't be built; it must fail closed and add a test. When #24 merges, close #1 and #14 per section 7.
 - **Needs the owner:** a real RAGAS run against Vertex (credentials); rotating the Jules API key that was pasted into an earlier session and storing it as the `JULES_API_KEY` environment secret.
 - **Not filed:** revisit the `langchain-community<0.4.0` pin when ragas is upgraded (nothing to do until then).
 - For any further follow-up: create an issue, label it `jules`, and run the normal review loop. Do not implement it yourself.
@@ -42,6 +42,8 @@ GitHub MCP tools disconnect often. Reload with ToolSearch, for example `select:m
 - Check what Jules actually pushed with `git merge-base --is-ancestor` and `git merge-tree --write-tree`; GitHub's `mergeable_state` can lag.
 - Verify docs by running every command and snippet against the source. In #20, the SQL, data model and a custom `AclFilter` example were wrong until Jules fixed them (the registry calls `cls(settings)` first, then `cls()`).
 - A new dependency needs a reason. The `langchain-community<0.4.0` pin was real: ragas 0.4.3 imports `langchain_community.chat_models.vertexai`, removed in 0.4.x.
+- Jules copies issue references into `Closes #N`. Both follow-up PRs said `Closes #14` because their issues began "Follow-up from #14". Remove it from the PR body before merging, or #14 (the runbook) auto-closes.
+- The local Postgres server in a cloud session can stop between check-ins. If DB tests error with "Connection refused", run `service postgresql start` and re-run before blaming the PR.
 - Persona ground truth is `examples/acme/README.md`; it matches `Policy.decide` plus the chunker overrides. No persona can read the "Break-glass access" section under v1 or v2. Canaries match `[A-Z0-9]+-\d{4}`.
 
 ## 6. Talking to Jules
