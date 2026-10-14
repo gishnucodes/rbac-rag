@@ -12,11 +12,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from google import genai
+
+from ragas.llms import InstructorLLM
+from ragas.llms.base import InstructorModelArgs
+
 from evals.ragas_eval import (
     GeminiRagasEmbeddingAdapter,
+    build_google_ragas_llm,
     check_google_credentials,
     compute_unauthorized_canaries_by_persona,
     evaluate_sample,
+    run_eval,
 )
 from rbac_rag.config import Settings
 from rbac_rag.pipeline.rag import REFUSAL
@@ -335,3 +342,139 @@ def test_compute_unauthorized_canaries_by_persona_raises():
             policy_version=999,
             settings=Settings(database_url="postgresql://invalid:invalid@localhost:5432/invalid"),
         )
+
+
+def test_build_google_ragas_llm_async_interface():
+    client = genai.Client(api_key="fake-test-key")
+    llm = build_google_ragas_llm(client, "gemini-2.0-flash")
+    assert llm.is_async is True
+    assert hasattr(llm, "agenerate")
+
+
+def test_evaluate_sample_leakage_critic_error_fail_closed(tmp_path):
+    sample = {
+        "id": "sample_critic_error",
+        "persona": "alice",
+        "question": "What is Q3 revenue?",
+        "should_refuse": False,
+        "reference": "Q3 revenue was $48.2M.",
+        "sensitive_facts": "Q3 revenue $48.2M.",
+    }
+
+    dummy_answer = Answer(
+        question="What is Q3 revenue?",
+        text="Consolidated Q3 revenue reached $48.2M.",
+        refused=False,
+        retrieval=RetrievalResult(
+            user=UserContext(user_id="alice", policy_version=1),
+            policy_version=1,
+            query="What is Q3 revenue?",
+            chunks=[],  # empty chunks so RAGAS faithfulness/relevancy metrics are skipped
+        ),
+    )
+
+    mock_rag_pipeline = MagicMock()
+    mock_rag_pipeline.answer.return_value = dummy_answer
+    mock_llm = InstructorLLM(
+        client=MagicMock(),
+        model="gemini-2.0-flash",
+        provider="google",
+        model_args=InstructorModelArgs(),
+    )
+
+    with patch("evals.ragas_eval.DiscreteMetric") as mock_discrete:
+        # Simulate LLM/ascore throwing an exception (e.g. client error)
+        mock_discrete.return_value.ascore = AsyncMock(side_effect=RuntimeError("Cannot use agenerate() with a synchronous client."))
+
+        res = asyncio.run(
+            evaluate_sample(
+                sample=sample,
+                policy_version=1,
+                settings=Settings(),
+                llm=mock_llm,
+                ragas_embeddings=MagicMock(),
+                semaphore=asyncio.Semaphore(1),
+                rag_pipeline=mock_rag_pipeline,
+                unauthorized_canaries=set(),
+            )
+        )
+
+        assert res["leakage_critic"] == "error"
+
+
+def test_run_eval_fail_closed_on_critic_error(tmp_path):
+    dataset_sample = [
+        {
+            "id": "sample_err_1",
+            "persona": "alice",
+            "question": "Test question",
+            "should_refuse": False,
+            "reference": "Test ref",
+            "sensitive_facts": ["fact1"],
+        }
+    ]
+
+    mock_answer = Answer(
+        question="Test question",
+        text="Some response",
+        refused=False,
+        retrieval=RetrievalResult(
+            user=UserContext(user_id="alice", policy_version=1),
+            policy_version=1,
+            query="Test question",
+            chunks=[],
+        ),
+    )
+
+    mock_rag_pipeline = MagicMock()
+    mock_rag_pipeline.answer.return_value = mock_answer
+
+    saved_payloads = []
+
+    def mock_save_report(payload, output_dir, filename_prefix):
+        saved_payloads.append(payload)
+        return (tmp_path / "report.json", tmp_path / "report.md")
+
+    mock_llm = InstructorLLM(
+        client=MagicMock(),
+        model="gemini-2.0-flash",
+        provider="google",
+        model_args=InstructorModelArgs(),
+    )
+
+    with (
+        patch("evals.ragas_eval.check_google_credentials", return_value=True),
+        patch("evals.ragas_eval.genai_client", return_value=MagicMock()),
+        patch("evals.ragas_eval.build_google_ragas_llm", return_value=mock_llm),
+        patch("evals.ragas_eval.GeminiEmbedder", return_value=MagicMock()),
+        patch("evals.ragas_eval.load_dataset", return_value=dataset_sample),
+        patch("evals.ragas_eval.compute_unauthorized_canaries_by_persona", return_value=({}, set())),
+        patch("evals.ragas_eval.evaluate_sample") as mock_eval_sample,
+        patch("evals.ragas_eval.save_report", side_effect=mock_save_report),
+    ):
+        mock_eval_sample.return_value = {
+            "id": "sample_err_1",
+            "persona": "alice",
+            "question": "Test question",
+            "should_refuse": False,
+            "refused": False,
+            "refusal_correctness": True,
+            "canary_safe": True,
+            "leaked_canaries": [],
+            "leakage_critic": "error",
+            "response": "Some response",
+            "retrieved_contexts": [],
+            "faithfulness": None,
+            "answer_relevancy": None,
+            "context_precision": None,
+            "context_recall": None,
+        }
+
+        with pytest.raises(RuntimeError, match="RAGAS evaluation failed: judge/critic errored on 1 or more rows"):
+            asyncio.run(run_eval(policy_version=1))
+
+        assert len(saved_payloads) == 1
+        payload = saved_payloads[0]
+        assert payload["is_valid"] is False
+        assert payload["summary"]["is_valid"] is False
+        assert payload["summary"]["overall_metrics"]["leakage_critic_safe_rate"] == 0.0
