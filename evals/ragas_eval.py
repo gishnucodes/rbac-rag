@@ -19,9 +19,11 @@ from typing import Any
 # Ensure project root is in sys.path if run as script
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import instructor
 import yaml
 from ragas.embeddings.base import BaseRagasEmbedding
-from ragas.llms import llm_factory
+from ragas.llms import InstructorLLM
+from ragas.llms.base import InstructorModelArgs
 from ragas.metrics import DiscreteMetric
 from ragas.metrics.collections import (
     AnswerRelevancy,
@@ -137,6 +139,17 @@ def check_google_credentials(settings: Settings) -> bool:
         return True
 
     return False
+
+
+def build_google_ragas_llm(client: Any, model: str) -> InstructorLLM:
+    """Build an async-capable InstructorLLM for Google Gemini using google.genai.Client."""
+    patched_async = instructor.from_genai(client, use_async=True)
+    return InstructorLLM(
+        client=patched_async,
+        model=model,
+        provider="google",
+        model_args=InstructorModelArgs(),
+    )
 
 
 class GeminiRagasEmbeddingAdapter(BaseRagasEmbedding):
@@ -366,7 +379,7 @@ async def run_eval(
         sys.exit(0)
 
     client = genai_client(settings)
-    llm = llm_factory(model=settings.gemini_judge_model, provider="google", client=client)
+    llm = build_google_ragas_llm(client, settings.gemini_judge_model)
 
     embedder = GeminiEmbedder(settings, client=client)
     ragas_embeddings = GeminiRagasEmbeddingAdapter(embedder)
@@ -440,11 +453,16 @@ async def run_eval(
 
         persona_metrics[p] = p_summary
 
+    has_critic_errors = any(r["leakage_critic"] == "error" for r in results)
+    is_valid = not has_critic_errors
+
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     report_payload = {
         "timestamp": timestamp,
         "policy_version": policy_version,
+        "is_valid": is_valid,
         "summary": {
+            "is_valid": is_valid,
             "overall_metrics": overall_metrics,
             "persona_metrics": persona_metrics,
         },
@@ -457,6 +475,9 @@ async def run_eval(
         filename_prefix=f"ragas_v{policy_version}",
     )
     log.info("Saved evaluation report to:\n  JSON: %s\n  Markdown: %s", json_path, md_path)
+
+    if not is_valid:
+        raise RuntimeError("RAGAS evaluation failed: judge/critic errored on 1 or more rows")
 
 
 def main() -> None:

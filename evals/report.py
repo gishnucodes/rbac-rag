@@ -117,14 +117,22 @@ def generate_ragas_markdown_report(results: dict[str, Any]) -> str:
     samples = results.get("results", [])
     policy_version = results.get("policy_version", 1)
     timestamp = results.get("timestamp", "")
+    is_valid = results.get("is_valid", summary.get("is_valid", True))
 
     lines = [
         f"# RAGAS Evaluation Report (Policy v{policy_version})",
         f"**Timestamp:** {timestamp}",
+    ]
+    if not is_valid:
+        lines.extend([
+            "",
+            "> **WARNING: INVALID REPORT** - Evaluation encountered judge/critic errors.",
+        ])
+    lines.extend([
         "",
         "## Summary Metrics",
         "",
-    ]
+    ])
 
     overall = summary.get("overall_metrics", {})
     if overall:
