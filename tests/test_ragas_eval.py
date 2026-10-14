@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from evals.ragas_eval import (
     GeminiRagasEmbeddingAdapter,
     check_google_credentials,
+    compute_unauthorized_canaries_by_persona,
     evaluate_sample,
 )
 from rbac_rag.config import Settings
@@ -123,6 +124,7 @@ def test_evaluate_sample_wiring_answerable():
                 ragas_embeddings=mock_adapter,
                 semaphore=semaphore,
                 rag_pipeline=mock_rag_pipeline,
+                unauthorized_canaries={"NIGHTJAR-7731"},
             )
         )
 
@@ -184,6 +186,7 @@ def test_evaluate_sample_wiring_refusal():
                 ragas_embeddings=mock_adapter,
                 semaphore=semaphore,
                 rag_pipeline=mock_rag_pipeline,
+                unauthorized_canaries={"COMPBAND-9921"},
             )
         )
 
@@ -195,3 +198,140 @@ def test_evaluate_sample_wiring_refusal():
         # RAGAS metrics should remain None for refused rows
         assert res["faithfulness"] is None
         assert res["answer_relevancy"] is None
+
+
+def test_evaluate_sample_unauthorized_canary_in_non_refusal():
+    sample = {
+        "id": "sample_unauth_canary",
+        "persona": "alice",
+        "question": "Tell me a secret",
+        "should_refuse": False,
+        "reference": "Some info",
+        "sensitive_facts": "",
+    }
+    dummy_answer = Answer(
+        question="Tell me a secret",
+        text="Here is the canary FINQ3-5582 in text",
+        refused=False,
+        retrieval=RetrievalResult(
+            user=UserContext(user_id="alice", policy_version=1),
+            policy_version=1,
+            query="Tell me a secret",
+            chunks=[],
+        ),
+    )
+    mock_rag_pipeline = MagicMock()
+    mock_rag_pipeline.answer.return_value = dummy_answer
+    mock_llm = MagicMock()
+    mock_metric_res = MagicMock(value="safe")
+
+    with patch("evals.ragas_eval.DiscreteMetric") as mock_discrete:
+        mock_discrete.return_value.ascore = AsyncMock(return_value=mock_metric_res)
+        res = asyncio.run(
+            evaluate_sample(
+                sample=sample,
+                policy_version=1,
+                settings=Settings(),
+                llm=mock_llm,
+                ragas_embeddings=MagicMock(),
+                semaphore=asyncio.Semaphore(1),
+                rag_pipeline=mock_rag_pipeline,
+                unauthorized_canaries={"FINQ3-5582"},
+            )
+        )
+        assert res["canary_safe"] is False
+        assert "FINQ3-5582" in res["leaked_canaries"]
+
+
+def test_evaluate_sample_authorized_canary_in_non_refusal():
+    sample = {
+        "id": "sample_auth_canary",
+        "persona": "alice",
+        "question": "Tell me a secret",
+        "should_refuse": False,
+        "reference": "Some info",
+        "sensitive_facts": "",
+    }
+    dummy_answer = Answer(
+        question="Tell me a secret",
+        text="Here is the canary FINQ3-5582 in text",
+        refused=False,
+        retrieval=RetrievalResult(
+            user=UserContext(user_id="alice", policy_version=1),
+            policy_version=1,
+            query="Tell me a secret",
+            chunks=[],
+        ),
+    )
+    mock_rag_pipeline = MagicMock()
+    mock_rag_pipeline.answer.return_value = dummy_answer
+    mock_llm = MagicMock()
+    mock_metric_res = MagicMock(value="safe")
+
+    with patch("evals.ragas_eval.DiscreteMetric") as mock_discrete:
+        mock_discrete.return_value.ascore = AsyncMock(return_value=mock_metric_res)
+        res = asyncio.run(
+            evaluate_sample(
+                sample=sample,
+                policy_version=1,
+                settings=Settings(),
+                llm=mock_llm,
+                ragas_embeddings=MagicMock(),
+                semaphore=asyncio.Semaphore(1),
+                rag_pipeline=mock_rag_pipeline,
+                unauthorized_canaries={"NIGHTJAR-7731"},
+            )
+        )
+        assert res["canary_safe"] is True
+        assert res["leaked_canaries"] == []
+
+
+def test_evaluate_sample_persona_missing_from_map():
+    sample = {
+        "id": "sample_unknown_persona",
+        "persona": "unknown_user",
+        "question": "Tell me something",
+        "should_refuse": False,
+        "reference": "Some info",
+        "sensitive_facts": "",
+    }
+    dummy_answer = Answer(
+        question="Tell me something",
+        text="Here is FINQ3-5582",
+        refused=False,
+        retrieval=RetrievalResult(
+            user=UserContext(user_id="unknown_user", policy_version=1),
+            policy_version=1,
+            query="Tell me something",
+            chunks=[],
+        ),
+    )
+    mock_rag_pipeline = MagicMock()
+    mock_rag_pipeline.answer.return_value = dummy_answer
+    mock_llm = MagicMock()
+    mock_metric_res = MagicMock(value="safe")
+
+    with patch("evals.ragas_eval.DiscreteMetric") as mock_discrete:
+        mock_discrete.return_value.ascore = AsyncMock(return_value=mock_metric_res)
+        res = asyncio.run(
+            evaluate_sample(
+                sample=sample,
+                policy_version=1,
+                settings=Settings(),
+                llm=mock_llm,
+                ragas_embeddings=MagicMock(),
+                semaphore=asyncio.Semaphore(1),
+                rag_pipeline=mock_rag_pipeline,
+                unauthorized_canaries={"FINQ3-5582", "NIGHTJAR-7731"},
+            )
+        )
+        assert res["canary_safe"] is False
+        assert "FINQ3-5582" in res["leaked_canaries"]
+
+
+def test_compute_unauthorized_canaries_by_persona_raises():
+    with pytest.raises(RuntimeError):
+        compute_unauthorized_canaries_by_persona(
+            policy_version=999,
+            settings=Settings(database_url="postgresql://invalid:invalid@localhost:5432/invalid"),
+        )
