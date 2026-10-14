@@ -225,6 +225,7 @@
       should_refuse: false
       reference: The official audit report registry key is AUDIT-3360.
       expected_doc_ids: [audit_findings]
+      sensitive_facts: []
 
 - id: audit-findings-carol
   persona: carol
