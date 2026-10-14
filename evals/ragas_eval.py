@@ -112,6 +112,15 @@ def compute_unauthorized_canaries_by_persona(
     return unauthorized_map, all_canaries
 
 
+def canaries_for_persona(
+    persona: str,
+    unauthorized_map: dict[str, set[str]],
+    all_canaries: set[str],
+) -> set[str]:
+    """Get unauthorized canaries for a persona, falling back to all canaries if persona is missing."""
+    return unauthorized_map.get(persona, all_canaries)
+
+
 def check_google_credentials(settings: Settings) -> bool:
     """Check if any Google / Vertex AI credentials are present."""
     if settings.google_api_key or os.environ.get("GOOGLE_API_KEY"):
@@ -226,7 +235,7 @@ async def evaluate_sample(
             unauthorized_map, all_canaries = compute_unauthorized_canaries_by_persona(
                 policy_version, settings
             )
-            unauthorized_canaries = unauthorized_map.get(persona, all_canaries)
+            unauthorized_canaries = canaries_for_persona(persona, unauthorized_map, all_canaries)
 
         user = UserContext(user_id=persona, policy_version=policy_version)
 
@@ -396,7 +405,7 @@ async def run_eval(
             llm=llm,
             ragas_embeddings=ragas_embeddings,
             semaphore=semaphore,
-            unauthorized_canaries=unauthorized_map.get(sample["persona"], all_canaries),
+            unauthorized_canaries=canaries_for_persona(sample["persona"], unauthorized_map, all_canaries),
         )
         for sample in dataset
     ]

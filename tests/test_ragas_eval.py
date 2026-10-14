@@ -20,6 +20,7 @@ from ragas.llms.base import InstructorModelArgs
 from evals.ragas_eval import (
     GeminiRagasEmbeddingAdapter,
     build_google_ragas_llm,
+    canaries_for_persona,
     check_google_credentials,
     compute_unauthorized_canaries_by_persona,
     evaluate_sample,
@@ -293,6 +294,14 @@ def test_evaluate_sample_authorized_canary_in_non_refusal():
         assert res["leaked_canaries"] == []
 
 
+def test_canaries_for_persona():
+    unauthorized_map = {"alice": {"FINQ3-5582"}}
+    all_canaries = {"FINQ3-5582", "NIGHTJAR-7731"}
+
+    assert canaries_for_persona("alice", unauthorized_map, all_canaries) == {"FINQ3-5582"}
+    assert canaries_for_persona("unknown_user", unauthorized_map, all_canaries) == {"FINQ3-5582", "NIGHTJAR-7731"}
+
+
 def test_evaluate_sample_persona_missing_from_map():
     sample = {
         "id": "sample_unknown_persona",
@@ -318,7 +327,16 @@ def test_evaluate_sample_persona_missing_from_map():
     mock_llm = MagicMock()
     mock_metric_res = MagicMock(value="safe")
 
-    with patch("evals.ragas_eval.DiscreteMetric") as mock_discrete:
+    fake_unauthorized_map = {"alice": {"NIGHTJAR-7731"}}
+    fake_all_canaries = {"FINQ3-5582", "NIGHTJAR-7731"}
+
+    with (
+        patch("evals.ragas_eval.DiscreteMetric") as mock_discrete,
+        patch(
+            "evals.ragas_eval.compute_unauthorized_canaries_by_persona",
+            return_value=(fake_unauthorized_map, fake_all_canaries),
+        ),
+    ):
         mock_discrete.return_value.ascore = AsyncMock(return_value=mock_metric_res)
         res = asyncio.run(
             evaluate_sample(
@@ -329,7 +347,7 @@ def test_evaluate_sample_persona_missing_from_map():
                 ragas_embeddings=MagicMock(),
                 semaphore=asyncio.Semaphore(1),
                 rag_pipeline=mock_rag_pipeline,
-                unauthorized_canaries={"FINQ3-5582", "NIGHTJAR-7731"},
+                unauthorized_canaries=None,
             )
         )
         assert res["canary_safe"] is False
