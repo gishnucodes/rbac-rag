@@ -369,6 +369,79 @@ def test_build_google_ragas_llm_async_interface():
     assert hasattr(llm, "agenerate")
 
 
+def test_jsonref_installed_for_gemini_structured_output():
+    # instructor's Gemini structured-output path imports jsonref lazily; without it
+    # every judge call fails with "The 'jsonref' package is required ..." (issue #32).
+    import jsonref  # noqa: F401
+
+
+def _fill_genai_schema(schema):
+    """Build a minimal value that satisfies a google.genai Schema."""
+    if schema.enum:
+        return schema.enum[0]
+    if schema.any_of:
+        return _fill_genai_schema(schema.any_of[0])
+    kind = schema.type.value.upper() if schema.type else "OBJECT"
+    if kind == "STRING":
+        return "x"
+    if kind == "INTEGER":
+        return 1
+    if kind == "NUMBER":
+        return 1.0
+    if kind == "BOOLEAN":
+        return True
+    if kind == "ARRAY":
+        return [_fill_genai_schema(schema.items)]
+    return {k: _fill_genai_schema(v) for k, v in (schema.properties or {}).items()}
+
+
+def test_google_ragas_llm_structured_output_roundtrip_with_fake_client():
+    """Drive the real judge path (ragas metric -> InstructorLLM -> instructor genai
+    handler -> client.aio.models.generate_content) against a fake transport. This
+    exercises request-schema building (jsonref $ref resolution for nested models such
+    as Faithfulness' NLIStatementOutput) and response parsing, without credentials."""
+    from google.genai import types
+    from ragas.metrics import DiscreteMetric
+    from ragas.metrics.collections import Faithfulness
+
+    requested: list[str] = []
+
+    async def fake_generate_content(*args, **kwargs):
+        decl = kwargs["config"].tools[0].function_declarations[0]
+        requested.append(decl.name)
+        call = types.FunctionCall(name=decl.name, args=_fill_genai_schema(decl.parameters))
+        return types.GenerateContentResponse(
+            candidates=[
+                types.Candidate(
+                    content=types.Content(role="model", parts=[types.Part(function_call=call)]),
+                    finish_reason="STOP",
+                )
+            ]
+        )
+
+    client = genai.Client(api_key="fake-test-key")
+    client.aio.models.generate_content = fake_generate_content
+    llm = build_google_ragas_llm(client, "gemini-2.0-flash")
+
+    async def run():
+        leakage = DiscreteMetric(
+            name="leakage_critic",
+            prompt="Response: {response}\nSensitive Facts: {sensitive_facts}",
+            allowed_values=["safe", "leak"],
+        )
+        leak_res = await leakage.ascore(llm=llm, response="r", sensitive_facts="f")
+        faith_res = await Faithfulness(llm=llm).ascore(
+            user_input="q", response="r", retrieved_contexts=["c"]
+        )
+        return leak_res, faith_res
+
+    leak_res, faith_res = asyncio.run(run())
+
+    assert leak_res.value in ("safe", "leak")
+    assert faith_res.value == pytest.approx(1.0)
+    assert "NLIStatementOutput" in requested
+
+
 def test_evaluate_sample_leakage_critic_error_fail_closed(tmp_path):
     sample = {
         "id": "sample_critic_error",

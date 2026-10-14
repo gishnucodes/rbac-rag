@@ -21,6 +21,9 @@ dependencies = [
 evals = [
     "ragas>=0.4",
     "langchain-community<0.4.0",
+    # Gemini structured output in instructor (used by the RAGAS judge via
+    # ragas InstructorLLM) imports `jsonref`; the extra pulls it in.
+    "instructor[google-genai]>=1.17.0,<2",
 ]
 
 [project.scripts]
